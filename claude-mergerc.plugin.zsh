@@ -3,36 +3,103 @@
 # Merge Claude Code settings fragments with interactive diff/apply.
 # https://github.com/bezhermoso/claude-mergerc
 
+_claude_mergerc_usage() {
+  cat <<'EOF'
+Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-h]
+
+Merge Claude Code settings fragments into ~/.claude/settings.json.
+
+Options:
+  -d DIR    Fragments directory (repeatable). Extends CLAUDE_MERGERC_FRAGMENTS_DIR.
+  -i GLOB   Include pattern — filename glob (repeatable). Extends CLAUDE_MERGERC_INCLUDE.
+            Default: *.json
+  -x GLOB   Exclude pattern — filename glob (repeatable). Extends CLAUDE_MERGERC_EXCLUDE.
+  -h        Show this help.
+
+Environment (colon-separated lists):
+  CLAUDE_MERGERC_FRAGMENTS_DIR  Dirs. Default: ${XDG_CONFIG_HOME:-~/.config}/claude/fragments
+  CLAUDE_MERGERC_INCLUDE        Include globs. Default: *.json
+  CLAUDE_MERGERC_EXCLUDE        Exclude globs.
+  CLAUDE_MERGERC_OUTPUT         Output file. Default: ~/.claude/settings.json
+
+Dirs are processed in order; within each dir, files are sorted by basename.
+Later files override earlier ones for deep-merged values.
+EOF
+}
+
 claude-mergerc() {
   emulate -L zsh
   setopt local_options err_exit no_unset pipe_fail
 
-  local fragments_dir="${CLAUDE_MERGERC_FRAGMENTS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude/fragments}"
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
   local staging="${TMPDIR:-/tmp}/claude-mergerc-staging.$$.json"
+
+  local -a fragment_dirs include_patterns exclude_patterns
+  if [[ -n "${CLAUDE_MERGERC_FRAGMENTS_DIR:-}" ]]; then
+    fragment_dirs=("${(@s/:/)CLAUDE_MERGERC_FRAGMENTS_DIR}")
+  else
+    fragment_dirs=("${XDG_CONFIG_HOME:-$HOME/.config}/claude/fragments")
+  fi
+  [[ -n "${CLAUDE_MERGERC_INCLUDE:-}" ]] && include_patterns=("${(@s/:/)CLAUDE_MERGERC_INCLUDE}")
+  [[ -n "${CLAUDE_MERGERC_EXCLUDE:-}" ]] && exclude_patterns=("${(@s/:/)CLAUDE_MERGERC_EXCLUDE}")
+
+  local OPTARG OPTIND opt
+  OPTIND=1
+  while getopts ":d:i:x:h" opt; do
+    case "$opt" in
+      d) fragment_dirs+=("$OPTARG") ;;
+      i) include_patterns+=("$OPTARG") ;;
+      x) exclude_patterns+=("$OPTARG") ;;
+      h) _claude_mergerc_usage; return 0 ;;
+      :) echo "error: -$OPTARG requires an argument" >&2; return 1 ;;
+      \?) echo "error: unknown option -$OPTARG" >&2; return 1 ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+
+  (( ${#include_patterns[@]} == 0 )) && include_patterns=('*.json')
 
   if ! command -v jq &>/dev/null; then
     echo "error: jq is required but not found in PATH" >&2
     return 1
   fi
 
-  if [[ ! -d "$fragments_dir" ]]; then
-    echo "error: fragments dir not found: $fragments_dir" >&2
-    echo "       set CLAUDE_MERGERC_FRAGMENTS_DIR to override the default." >&2
+  local -a fragment_files dir_files
+  local dir f fname pat included excluded
+  for dir in "${fragment_dirs[@]}"; do
+    if [[ ! -d "$dir" ]]; then
+      echo "warning: skipping missing fragments dir: $dir" >&2
+      continue
+    fi
+    dir_files=()
+    for f in "$dir"/**/*(.N); do
+      fname="${f:t}"
+      included=0
+      for pat in "${include_patterns[@]}"; do
+        [[ "$fname" == ${~pat} ]] && { included=1; break; }
+      done
+      (( included )) || continue
+      excluded=0
+      for pat in "${exclude_patterns[@]}"; do
+        [[ "$fname" == ${~pat} ]] && { excluded=1; break; }
+      done
+      (( excluded )) && continue
+      dir_files+=("$f")
+    done
+    fragment_files+=("${(on)dir_files[@]}")
+  done
+
+  if (( ${#fragment_files[@]} == 0 )); then
+    echo "error: no matching fragments found" >&2
+    echo "       dirs:    ${(j/, /)fragment_dirs}" >&2
+    echo "       include: ${(j/, /)include_patterns}" >&2
+    (( ${#exclude_patterns[@]} )) && echo "       exclude: ${(j/, /)exclude_patterns}" >&2
     return 1
   fi
 
-  local fragment_count
-  fragment_count=$(find "$fragments_dir" -name '*.json' | wc -l | tr -d ' ')
-  if (( fragment_count == 0 )); then
-    echo "error: no .json fragments in $fragments_dir" >&2
-    return 1
-  fi
+  echo "Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)..."
 
-  echo "Merging $fragment_count fragments from $fragments_dir..."
-
-  find "$fragments_dir" -name '*.json' | sort | \
-    xargs jq -s '
+  jq -s '
       def deep_merge(a; b):
         a as $a | b as $b |
         if ($a | type) == "object" and ($b | type) == "object" then
@@ -49,7 +116,7 @@ claude-mergerc() {
         else $b
         end;
       reduce .[] as $item ({}; deep_merge(.; $item))
-    ' > "$staging"
+    ' "${fragment_files[@]}" > "$staging"
 
   if [[ ! -f "$output" ]]; then
     echo "No existing settings.json found. Will create new."
