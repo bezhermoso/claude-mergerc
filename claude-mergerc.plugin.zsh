@@ -24,12 +24,16 @@ Environment (colon-separated lists):
 
 Dirs are processed in order; within each dir, files are sorted by basename.
 Later files override earlier ones for deep-merged values.
+
+If the output path is a symlink to a regular file, the link is followed and
+its target is overwritten (standard dotfile-manager behavior). Symlinks to
+directories, broken symlinks, and non-regular files are rejected.
 EOF
 }
 
 claude-mergerc() {
   emulate -L zsh
-  setopt local_options err_exit no_unset pipe_fail
+  setopt local_options err_return no_unset pipe_fail
 
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
   local staging="${TMPDIR:-/tmp}/claude-mergerc-staging.$$.json"
@@ -61,6 +65,28 @@ claude-mergerc() {
 
   if ! command -v jq &>/dev/null; then
     echo "error: jq is required but not found in PATH" >&2
+    return 1
+  fi
+
+  if [[ -L "$output" ]]; then
+    local link_target
+    link_target=$(readlink "$output")
+    if [[ ! -e "$output" ]]; then
+      echo "error: $output is a broken symlink → $link_target" >&2
+      echo "       remove or fix the symlink before merging" >&2
+      return 1
+    elif [[ ! -f "$output" ]]; then
+      echo "error: $output is a symlink to a non-regular file → $link_target" >&2
+      return 1
+    fi
+  elif [[ -e "$output" && ! -f "$output" ]]; then
+    local type_desc
+    if [[ -d "$output" ]]; then type_desc="directory"
+    elif [[ -p "$output" ]]; then type_desc="named pipe"
+    elif [[ -S "$output" ]]; then type_desc="socket"
+    else type_desc="non-regular file"
+    fi
+    echo "error: $output exists but is not a regular file ($type_desc)" >&2
     return 1
   fi
 
@@ -118,7 +144,7 @@ claude-mergerc() {
       reduce .[] as $item ({}; deep_merge(.; $item))
     ' "${fragment_files[@]}" > "$staging"
 
-  if [[ ! -f "$output" ]]; then
+  if [[ ! -e "$output" ]]; then
     echo "No existing settings.json found. Will create new."
     echo ""
     jq '.' "$staging"
