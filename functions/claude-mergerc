@@ -319,3 +319,8 @@ function claude-mergerc() {
       ;;
   esac
 }
+
+# On first invocation, zsh's native autoload executes this file's body — which
+# only *defines* the functions above — without running the command. Call it
+# explicitly so the first invocation behaves like every other one.
+claude-mergerc "$@"
