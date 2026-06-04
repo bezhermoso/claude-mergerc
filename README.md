@@ -1,13 +1,16 @@
 # claude-mergerc
 
-A zsh plugin that merges multiple JSON fragments into your `~/.claude/settings.json`, with an interactive diff/apply flow.
+A zsh plugin that merges multiple JSON or YAML fragments into your `~/.claude/settings.json`, with an interactive diff/apply flow.
 
 Claude Code reads a single `settings.json`, but splitting that config across smaller, purpose-scoped fragments is often easier to maintain. `claude-mergerc` deep-merges the fragments into one file, shows you a diff, and lets you apply, back up, or edit manually before overwriting.
+
+Fragments may be written in YAML, and the diff/manual-merge flow can run in YAML (`-y`) — but the output written to `settings.json` is **always JSON**, since that's the only format Claude Code reads.
 
 ## Requirements
 
 - `zsh`
 - [`jq`](https://jqlang.org/)
+- [`yq`](https://github.com/mikefarah/yq) (mikefarah, v4+) — required only for YAML fragments and YAML mode (`-y`)
 - Optional: [`delta`](https://github.com/dandavison/delta) or `colordiff` for nicer diffs (falls back to `diff --color`)
 
 ## Installation
@@ -36,7 +39,7 @@ echo 'source ~/.zsh/claude-mergerc/claude-mergerc.plugin.zsh' >> ~/.zshrc
 
 ## Usage
 
-Drop JSON fragments into your fragments directory (default: `~/.config/claude/fragments/`), then run:
+Drop JSON or YAML fragments into your fragments directory (default: `~/.config/claude/fragments/`), then run:
 
 ```zsh
 claude-mergerc
@@ -44,12 +47,12 @@ claude-mergerc
 
 The command will:
 
-1. Deep-merge every `*.json` file under the fragments directory (sorted by filename).
+1. Deep-merge every `*.json`, `*.yaml`, and `*.yml` file under the fragments directory (sorted by filename). YAML fragments are converted to JSON (via `yq`) before merging.
 2. Compare the result against your existing `~/.claude/settings.json`.
 3. Show a diff, then prompt:
    - **[a]** Apply merged config (overwrite current)
    - **[b]** Backup current, then apply
-   - **[e]** Open both in `$EDITOR` (vimdiff-style manual merge)
+   - **[e]** Manual merge in `$EDITOR` (vimdiff-style): a `to-apply` buffer seeded from your current settings opens next to the read-only-by-convention `from-fragments` merge result. Pull in the hunks you want, save, quit — `to-apply` is what gets written.
    - **[q]** Quit, no changes
 
 If `~/.claude/settings.json` doesn't exist yet, it prints the merged output and asks whether to create it.
@@ -57,7 +60,7 @@ If `~/.claude/settings.json` doesn't exist yet, it prints the merged output and 
 ### Flags
 
 ```
-claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-h]
+claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
 ```
 
 | Flag       | Purpose                                                                 |
@@ -65,6 +68,7 @@ claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-h]
 | `-d DIR`   | Add a fragments directory (repeatable). Extends `CLAUDE_MERGERC_FRAGMENTS_DIR`. |
 | `-i GLOB`  | Add an include pattern — filename glob (repeatable). Extends `CLAUDE_MERGERC_INCLUDE`. |
 | `-x GLOB`  | Add an exclude pattern — filename glob (repeatable). Extends `CLAUDE_MERGERC_EXCLUDE`. |
+| `-y`       | YAML mode: stage the merged config as YAML, diff in YAML, and manual-merge in YAML buffers. Output is still JSON. |
 | `-h`       | Show help.                                                              |
 
 Examples:
@@ -87,9 +91,10 @@ Override defaults via environment variables. List-valued variables use `:` as th
 | Variable                        | Default                                                 |
 | ------------------------------- | ------------------------------------------------------- |
 | `CLAUDE_MERGERC_FRAGMENTS_DIR`  | `${XDG_CONFIG_HOME:-$HOME/.config}/claude/fragments`    |
-| `CLAUDE_MERGERC_INCLUDE`        | `*.json`                                                |
+| `CLAUDE_MERGERC_INCLUDE`        | `*.json:*.yaml:*.yml`                                   |
 | `CLAUDE_MERGERC_EXCLUDE`        | *(none)*                                                |
 | `CLAUDE_MERGERC_OUTPUT`         | `$HOME/.claude/settings.json`                           |
+| `CLAUDE_MERGERC_YAML`           | *(unset)* — set to `1` to enable YAML mode (same as `-y`) |
 
 Example:
 
@@ -110,6 +115,36 @@ CLI flags extend these lists for a single invocation rather than replacing them.
 - **Scalars** (strings, numbers, booleans): later fragments win.
 
 Within each directory, fragments are sorted by filename — so prefixes like `00-base.json`, `10-permissions.json`, `99-overrides.json` control precedence. Across directories, earlier dirs are base layers and later dirs are overlays: a fragment in a later dir wins over same-keyed values from earlier dirs.
+
+## YAML support
+
+Requires [`yq`](https://github.com/mikefarah/yq) (mikefarah, v4+). JSON-only setups don't need it.
+
+### YAML fragments
+
+Fragments can be `*.yaml` / `*.yml` — handy for comments and less quoting:
+
+```yaml
+# 20-hooks.yaml — comments survive in the fragment (not in the output)
+hooks:
+  PostToolUse:
+    - matcher: Edit|Write
+      hooks:
+        - type: command
+          command: my-format-hook
+```
+
+YAML fragments are converted to JSON before merging, so they mix freely with JSON fragments in the same directory and follow the same ordering rules.
+
+### YAML mode (`-y`)
+
+`claude-mergerc -y` runs the whole interactive flow in YAML:
+
+- The merged config is staged as YAML.
+- The diff is shown YAML-vs-YAML (your current `settings.json` is converted on the fly).
+- The `[e]` manual-merge option opens YAML buffers in `$EDITOR`; the edited result is converted back and validated before applying.
+
+Regardless of mode, **the file written to `settings.json` is always JSON** — YAML is only used for fragments and the human-facing diff/edit steps, because Claude Code only reads JSON.
 
 ## Examples
 
@@ -184,7 +219,7 @@ Because earlier dirs are base layers and later dirs are overlays, the work fragm
 
 ### Sharing fragments across machines
 
-Because fragments are plain JSON files in a directory, they sync cleanly through any dotfiles manager (GNU stow, chezmoi, bare git repo, etc.). Run `claude-mergerc` after pulling changes to stitch the new fragments into `settings.json`.
+Because fragments are plain JSON/YAML files in a directory, they sync cleanly through any dotfiles manager (GNU stow, chezmoi, bare git repo, etc.). Run `claude-mergerc` after pulling changes to stitch the new fragments into `settings.json`.
 
 ## License
 

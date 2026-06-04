@@ -5,22 +5,27 @@
 
 function _claude_mergerc_usage() {
   cat <<'EOF'
-Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-h]
+Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
 
 Merge Claude Code settings fragments into ~/.claude/settings.json.
 
 Options:
   -d DIR    Fragments directory (repeatable). Extends CLAUDE_MERGERC_FRAGMENTS_DIR.
   -i GLOB   Include pattern — filename glob (repeatable). Extends CLAUDE_MERGERC_INCLUDE.
-            Default: *.json
+            Default: *.json, *.yaml, *.yml
   -x GLOB   Exclude pattern — filename glob (repeatable). Extends CLAUDE_MERGERC_EXCLUDE.
+  -y        YAML mode: stage the merged config as YAML, show the diff in YAML,
+            and open YAML buffers for manual merge. Output is still JSON.
   -h        Show this help.
 
 Environment (colon-separated lists):
   CLAUDE_MERGERC_FRAGMENTS_DIR  Dirs. Default: ${XDG_CONFIG_HOME:-~/.config}/claude/fragments
-  CLAUDE_MERGERC_INCLUDE        Include globs. Default: *.json
+  CLAUDE_MERGERC_INCLUDE        Include globs. Default: *.json:*.yaml:*.yml
   CLAUDE_MERGERC_EXCLUDE        Exclude globs.
   CLAUDE_MERGERC_OUTPUT         Output file. Default: ~/.claude/settings.json
+  CLAUDE_MERGERC_YAML           Set to 1 to enable YAML mode (same as -y).
+
+YAML fragments and YAML mode require yq (https://github.com/mikefarah/yq).
 
 Dirs are processed in order; within each dir, files are sorted by basename.
 Later files override earlier ones for deep-merged values.
@@ -31,12 +36,26 @@ directories, broken symlinks, and non-regular files are rejected.
 EOF
 }
 
+function _claude_mergerc_require_yq() {
+  if ! command -v yq &>/dev/null; then
+    echo "error: yq is required for YAML support but not found in PATH" >&2
+    echo "       install: https://github.com/mikefarah/yq" >&2
+    return 1
+  fi
+  if ! yq --version 2>/dev/null | grep -q mikefarah; then
+    echo "error: incompatible yq found; mikefarah/yq v4+ is required for YAML support" >&2
+    echo "       install: https://github.com/mikefarah/yq" >&2
+    return 1
+  fi
+}
+
 function claude-mergerc() {
   emulate -L zsh
   setopt local_options err_return no_unset pipe_fail
 
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
-  local staging="${TMPDIR:-/tmp}/claude-mergerc-staging.$$.json"
+  local yaml_mode=0
+  [[ "${CLAUDE_MERGERC_YAML:-}" == (1|true|yes) ]] && yaml_mode=1
 
   local -a fragment_dirs include_patterns exclude_patterns
   if [[ -n "${CLAUDE_MERGERC_FRAGMENTS_DIR:-}" ]]; then
@@ -49,11 +68,12 @@ function claude-mergerc() {
 
   local OPTARG OPTIND opt
   OPTIND=1
-  while getopts ":d:i:x:h" opt; do
+  while getopts ":d:i:x:yh" opt; do
     case "$opt" in
       d) fragment_dirs+=("$OPTARG") ;;
       i) include_patterns+=("$OPTARG") ;;
       x) exclude_patterns+=("$OPTARG") ;;
+      y) yaml_mode=1 ;;
       h) _claude_mergerc_usage; return 0 ;;
       :) echo "error: -$OPTARG requires an argument" >&2; return 1 ;;
       \?) echo "error: unknown option -$OPTARG" >&2; return 1 ;;
@@ -61,7 +81,7 @@ function claude-mergerc() {
   done
   shift $((OPTIND - 1))
 
-  (( ${#include_patterns[@]} == 0 )) && include_patterns=('*.json')
+  (( ${#include_patterns[@]} == 0 )) && include_patterns=('*.json' '*.yaml' '*.yml')
 
   if ! command -v jq &>/dev/null; then
     echo "error: jq is required but not found in PATH" >&2
@@ -123,8 +143,38 @@ function claude-mergerc() {
     return 1
   fi
 
+  local has_yaml=0
+  for f in "${fragment_files[@]}"; do
+    [[ "$f" == *.(yaml|yml) ]] && { has_yaml=1; break; }
+  done
+  if (( has_yaml || yaml_mode )); then
+    _claude_mergerc_require_yq
+  fi
+
+  local workdir="${TMPDIR:-/tmp}/claude-mergerc.$$"
+  mkdir -p "$workdir"
+  # Expand $workdir now: function-scoped EXIT traps run after locals are gone.
+  trap "rm -rf ${(q)workdir}" EXIT
+
+  # Convert YAML fragments to JSON so jq can merge a uniform stream.
+  local -a merge_inputs
+  local n=0 converted
+  for f in "${fragment_files[@]}"; do
+    if [[ "$f" == *.(yaml|yml) ]]; then
+      converted="$workdir/fragment-$((++n)).json"
+      if ! yq -o=json '.' "$f" > "$converted"; then
+        echo "error: failed to parse YAML fragment: $f" >&2
+        return 1
+      fi
+      merge_inputs+=("$converted")
+    else
+      merge_inputs+=("$f")
+    fi
+  done
+
   echo "Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)..."
 
+  local merged_json="$workdir/from-fragments.json"
   jq -s '
       def deep_merge(a; b):
         a as $a | b as $b |
@@ -142,46 +192,77 @@ function claude-mergerc() {
         else $b
         end;
       reduce .[] as $item ({}; deep_merge(.; $item))
-    ' "${fragment_files[@]}" > "$staging"
+    ' "${merge_inputs[@]}" > "$merged_json"
+
+  # In YAML mode, stage the merged config as YAML for diff/editor.
+  # YAML is for human eyes only: every path that writes $output writes JSON,
+  # since Claude Code only reads JSON settings.
+  local merged_yaml="$workdir/from-fragments.yaml"
+  if (( yaml_mode )); then
+    yq -P 'sort_keys(..)' -o=yaml "$merged_json" > "$merged_yaml"
+  fi
 
   if [[ ! -e "$output" ]]; then
     echo "No existing settings.json found. Will create new."
     echo ""
-    jq '.' "$staging"
+    if (( yaml_mode )); then
+      cat "$merged_yaml"
+    else
+      jq '.' "$merged_json"
+    fi
     echo ""
-    read -q "reply?Create $output? [y/n] " || { echo "\nAborted."; rm -f "$staging"; return 0 }
+    read -q "reply?Create $output? [y/n] " || { echo "\nAborted."; return 0 }
     echo ""
     mkdir -p "$(dirname "$output")"
-    cp "$staging" "$output"
-    rm -f "$staging"
+    cp "$merged_json" "$output"
     echo "Created $output"
     return 0
   fi
 
   local existing_normalized merged_normalized
   existing_normalized=$(jq -S '.' "$output")
-  merged_normalized=$(jq -S '.' "$staging")
+  merged_normalized=$(jq -S '.' "$merged_json")
 
   if [[ "$existing_normalized" == "$merged_normalized" ]]; then
     echo "No changes. Settings are already in sync."
-    rm -f "$staging"
     return 0
+  fi
+
+  # Materialize both sides for diffing — YAML or sorted JSON.
+  # "current" = what settings.json holds now; "from-fragments" = the merge result.
+  local diff_current diff_merged
+  if (( yaml_mode )); then
+    diff_current="$workdir/diff/current.yaml"
+    diff_merged="$workdir/diff/from-fragments.yaml"
+    mkdir -p "$workdir/diff"
+    yq -P 'sort_keys(..)' -o=yaml "$output" > "$diff_current"
+    cp "$merged_yaml" "$diff_merged"
+  else
+    diff_current="$workdir/diff/current.json"
+    diff_merged="$workdir/diff/from-fragments.json"
+    mkdir -p "$workdir/diff"
+    jq -S '.' "$output" > "$diff_current"
+    jq -S '.' "$merged_json" > "$diff_merged"
   fi
 
   echo "Differences found:\n"
 
   if command -v delta &>/dev/null; then
-    delta <(jq -S '.' "$output") <(jq -S '.' "$staging") --pager=never || true
+    delta "$diff_current" "$diff_merged" --pager=never || true
   elif command -v colordiff &>/dev/null; then
-    colordiff <(jq -S '.' "$output") <(jq -S '.' "$staging") || true
+    colordiff "$diff_current" "$diff_merged" || true
   else
-    diff --color=auto -u <(jq -S '.' "$output") <(jq -S '.' "$staging") || true
+    diff --color=auto -u "$diff_current" "$diff_merged" || true
   fi
 
   echo ""
   echo "  [a] Apply merged config (overwrites current)"
   echo "  [b] Backup current, then apply"
-  echo "  [e] Open both in \$EDITOR (manual merge)"
+  if (( yaml_mode )); then
+    echo "  [e] Manual merge in \$EDITOR as YAML (edit 'to-apply', pull from 'from-fragments')"
+  else
+    echo "  [e] Manual merge in \$EDITOR (edit 'to-apply', pull from 'from-fragments')"
+  fi
   echo "  [q] Quit, no changes"
   echo ""
   local choice
@@ -190,36 +271,51 @@ function claude-mergerc() {
 
   case "$choice" in
     a)
-      cp "$staging" "$output"
+      cp "$merged_json" "$output"
       echo "Applied merged config to $output"
       ;;
     b)
       local backup="${output}.bak.$(date +%Y%m%d%H%M%S)"
       cp "$output" "$backup"
-      cp "$staging" "$output"
+      cp "$merged_json" "$output"
       echo "Backup → $backup"
       echo "Applied merged config to $output"
       ;;
     e)
-      local merge_tmp="${TMPDIR:-/tmp}/claude-mergerc-manual.$$.json"
-      cp "$output" "$merge_tmp"
-      ${EDITOR:-vim} -d "$merge_tmp" "$staging"
-      if jq empty "$merge_tmp" 2>/dev/null; then
-        read -q "reply?Apply manually merged result? [y/n] " || { echo "\nAborted."; rm -f "$staging" "$merge_tmp"; return 0 }
-        echo ""
-        cp "$merge_tmp" "$output"
-        echo "Applied manually merged config."
+      # Buffer names signal intent: "to-apply" is seeded from the current
+      # settings, is the one you edit, and is what gets written to $output.
+      # "from-fragments" is the merged result, opened as reference only.
+      if (( yaml_mode )); then
+        local apply_tmp="$workdir/to-apply.yaml" apply_json="$workdir/to-apply.json"
+        cp "$diff_current" "$apply_tmp"
+        ${EDITOR:-vim} -d "$apply_tmp" "$merged_yaml"
+        if yq -o=json '.' "$apply_tmp" > "$apply_json" 2>/dev/null \
+            && jq empty "$apply_json" 2>/dev/null; then
+          read -q "reply?Apply manually merged result? [y/n] " || { echo "\nAborted."; return 0 }
+          echo ""
+          cp "$apply_json" "$output"
+          echo "Applied manually merged config."
+        else
+          echo "error: result is not valid YAML. Aborting." >&2
+          return 1
+        fi
       else
-        echo "error: result is not valid JSON. Aborting." >&2
-        rm -f "$staging" "$merge_tmp"
-        return 1
+        local apply_tmp="$workdir/to-apply.json"
+        cp "$output" "$apply_tmp"
+        ${EDITOR:-vim} -d "$apply_tmp" "$merged_json"
+        if jq empty "$apply_tmp" 2>/dev/null; then
+          read -q "reply?Apply manually merged result? [y/n] " || { echo "\nAborted."; return 0 }
+          echo ""
+          cp "$apply_tmp" "$output"
+          echo "Applied manually merged config."
+        else
+          echo "error: result is not valid JSON. Aborting." >&2
+          return 1
+        fi
       fi
-      rm -f "$merge_tmp"
       ;;
     q|*)
       echo "No changes made."
       ;;
   esac
-
-  rm -f "$staging"
 }
