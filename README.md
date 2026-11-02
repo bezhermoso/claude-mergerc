@@ -11,7 +11,7 @@ Fragments may be written in YAML, and the diff/manual-merge flow can run in YAML
 - `zsh`
 - [`jq`](https://jqlang.org/)
 - [`yq`](https://github.com/mikefarah/yq) (mikefarah, v4+) — required only for YAML fragments and YAML mode (`-y`)
-- Optional: [`delta`](https://github.com/dandavison/delta) or `colordiff` for nicer diffs (falls back to `diff --color`)
+- Optional: [`delta`](https://github.com/dandavison/delta) or `colordiff` for nicer diffs (otherwise diffs are coloured by `claude-mergerc` itself)
 
 ## Installation
 
@@ -136,6 +136,7 @@ Override defaults via environment variables. List-valued variables use `:` as th
 | `CLAUDE_MERGERC_EXCLUDE`        | *(none)*                                                |
 | `CLAUDE_MERGERC_OUTPUT`         | `$HOME/.claude/settings.json`                           |
 | `CLAUDE_MERGERC_YAML`           | *(unset)* — set to `1` to enable YAML mode (same as `-y`) |
+| `CLAUDE_MERGERC_COLOR`          | `auto` — colour output on a terminal that supports it, unless [`NO_COLOR`](https://no-color.org) is set. `always` / `never` force it. |
 
 Example:
 

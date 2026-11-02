@@ -52,12 +52,12 @@ EOF
 
 function _claude_mergerc_require_yq() {
   if ! command -v yq &>/dev/null; then
-    echo "error: yq is required for YAML support but not found in PATH" >&2
+    _claude_mergerc_err "yq is required for YAML support but not found in PATH"
     echo "       install: https://github.com/mikefarah/yq" >&2
     return 1
   fi
   if ! yq --version 2>/dev/null | grep -q mikefarah; then
-    echo "error: incompatible yq found; mikefarah/yq v4+ is required for YAML support" >&2
+    _claude_mergerc_err "incompatible yq found; mikefarah/yq v4+ is required for YAML support"
     echo "       install: https://github.com/mikefarah/yq" >&2
     return 1
   fi
@@ -149,7 +149,7 @@ function _claude_mergerc_merge() {
     if [[ "$f" == *.(yaml|yml) ]]; then
       converted="${out:h}/.yaml-to-json-$((++n)).json"
       if ! _claude_mergerc_to_json "$f" > "$converted"; then
-        echo "error: failed to parse YAML fragment: $f" >&2
+        _claude_mergerc_err "failed to parse YAML fragment: $f"
         return 1
       fi
       inputs+=("$converted")
@@ -161,14 +161,45 @@ function _claude_mergerc_merge() {
     "${inputs[@]}" > "$out"
 }
 
-function _claude_mergerc_show_diff() {
-  if command -v delta &>/dev/null; then
-    delta "$1" "$2" --pager=never || true
-  elif command -v colordiff &>/dev/null; then
-    colordiff "$1" "$2" || true
-  else
-    diff --color=auto -u "$1" "$2" || true
+# Set the c_* colour codes in the caller's scope; all empty when colour is off.
+# CLAUDE_MERGERC_COLOR=auto (default) colours only when stdout is a terminal
+# that supports at least 8 colours and NO_COLOR is unset; always/never force it.
+function _claude_mergerc_init_colors() {
+  c_reset="" c_bold="" c_dim="" c_red="" c_green="" c_yellow="" c_cyan=""
+  local ncolors
+  case "${CLAUDE_MERGERC_COLOR:-auto}" in
+    never|0|false|no) return 0 ;;
+    always|1|true|yes) ;;
+    *)
+      if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then return 0; fi
+      ncolors=$(tput colors 2>/dev/null) || ncolors=0
+      if [[ "$ncolors" != <-> ]] || (( ncolors < 8 )); then return 0; fi
+      ;;
+  esac
+  c_reset=$'\e[0m' c_bold=$'\e[1m' c_dim=$'\e[2m'
+  c_red=$'\e[31m' c_green=$'\e[32m' c_yellow=$'\e[33m' c_cyan=$'\e[36m'
+}
+
+# Messages on stderr: coloured only if stderr is a terminal too.
+function _claude_mergerc_err() {
+  local on="" off=""
+  if [[ -n "$c_reset" && ( -t 2 || "${CLAUDE_MERGERC_COLOR:-}" == (always|1|true|yes) ) ]]; then
+    on="$c_red" off="$c_reset"
   fi
+  print -r -- "${on}error:${off} $*" >&2
+}
+
+function _claude_mergerc_warn() {
+  local on="" off=""
+  if [[ -n "$c_reset" && ( -t 2 || "${CLAUDE_MERGERC_COLOR:-}" == (always|1|true|yes) ) ]]; then
+    on="$c_yellow" off="$c_reset"
+  fi
+  print -r -- "${on}warning:${off} $*" >&2
+}
+
+# A highlighted menu key, e.g. "[a]".
+function _claude_mergerc_key() {
+  print -rn -- "[${c_bold}${c_cyan}$1${c_reset}]"
 }
 
 # _claude_mergerc_ask_key VAR PROMPT KEYS — read single keypresses until one of
@@ -184,7 +215,7 @@ function _claude_mergerc_ask_key() {
       : ${(P)__var::=$__k}
       return 0
     fi
-    print -r -- "  Please press ${(j:, :)${(s::)__keys}}."
+    print -r -- "  ${c_yellow}Please press ${(j:, :)${(s::)__keys}}.${c_reset}"
   done
 }
 
@@ -200,6 +231,45 @@ function _claude_mergerc_ask_line() {
   local __var="$1" __line
   if ! read -r "__line?$2"; then echo ""; return 1; fi
   : ${(P)__var::=$__line}
+}
+
+# Colour a unified diff on stdin: additions green, removals red.
+function _claude_mergerc_colorize_diff() {
+  if [[ -z "$c_reset" ]]; then cat; return; fi
+  awk -v r="$c_red" -v g="$c_green" -v c="$c_cyan" -v b="$c_bold" -v z="$c_reset" '
+    /^(\+\+\+|---) / { print b $0 z; next }
+    /^@@/            { print c $0 z; next }
+    /^\+/            { print g $0 z; next }
+    /^-/             { print r $0 z; next }
+                     { print }'
+}
+
+# _claude_mergerc_diff BEFORE AFTER LABEL_BEFORE LABEL_AFTER — unified diff.
+# With colour on, it goes through delta or colordiff when installed, else our
+# own colouring; with colour off, it's plain.
+function _claude_mergerc_diff() {
+  local -a args
+  args=(-u --label "$3" --label "$4" "$1" "$2")
+  if [[ -z "$c_reset" ]]; then
+    diff "${args[@]}" || true
+  elif command -v delta &>/dev/null; then
+    diff "${args[@]}" | delta --pager=never || true
+  elif command -v colordiff &>/dev/null; then
+    diff "${args[@]}" | colordiff || true
+  else
+    diff "${args[@]}" | _claude_mergerc_colorize_diff || true
+  fi
+}
+
+# Print a JSON or YAML config file, syntax-coloured when colour is on.
+function _claude_mergerc_print_config() {
+  local -a color
+  if [[ -n "$c_reset" ]]; then color=(-C); fi
+  if [[ "$1" == *.(yaml|yml) ]]; then
+    yq "${color[@]}" '.' "$1"
+  else
+    jq "${color[@]}" '.' "$1"
+  fi
 }
 
 # Does a fragment basename match the include/exclude patterns in scope?
@@ -219,6 +289,9 @@ function _claude_mergerc_matches() {
 function claude-mergerc() {
   emulate -L zsh
   setopt local_options err_return no_unset pipe_fail
+
+  local c_reset c_bold c_dim c_red c_green c_yellow c_cyan
+  _claude_mergerc_init_colors
 
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
   local yaml_mode=0 mode=apply
@@ -244,8 +317,8 @@ function claude-mergerc() {
       c) mode=check ;;
       D) mode=drift ;;
       h) _claude_mergerc_usage; return 0 ;;
-      :) echo "error: -$OPTARG requires an argument" >&2; return 1 ;;
-      \?) echo "error: unknown option -$OPTARG" >&2; return 1 ;;
+      :) _claude_mergerc_err "-$OPTARG requires an argument"; return 1 ;;
+      \?) _claude_mergerc_err "unknown option -$OPTARG"; return 1 ;;
     esac
   done
   shift $((OPTIND - 1))
@@ -253,7 +326,7 @@ function claude-mergerc() {
   (( ${#include_patterns[@]} == 0 )) && include_patterns=('*.json' '*.yaml' '*.yml')
 
   if ! command -v jq &>/dev/null; then
-    echo "error: jq is required but not found in PATH" >&2
+    _claude_mergerc_err "jq is required but not found in PATH"
     return 1
   fi
 
@@ -261,11 +334,11 @@ function claude-mergerc() {
     local link_target
     link_target=$(readlink "$output")
     if [[ ! -e "$output" ]]; then
-      echo "error: $output is a broken symlink → $link_target" >&2
+      _claude_mergerc_err "$output is a broken symlink → $link_target"
       echo "       remove or fix the symlink before merging" >&2
       return 1
     elif [[ ! -f "$output" ]]; then
-      echo "error: $output is a symlink to a non-regular file → $link_target" >&2
+      _claude_mergerc_err "$output is a symlink to a non-regular file → $link_target"
       return 1
     fi
   elif [[ -e "$output" && ! -f "$output" ]]; then
@@ -275,7 +348,7 @@ function claude-mergerc() {
     elif [[ -S "$output" ]]; then type_desc="socket"
     else type_desc="non-regular file"
     fi
-    echo "error: $output exists but is not a regular file ($type_desc)" >&2
+    _claude_mergerc_err "$output exists but is not a regular file ($type_desc)"
     return 1
   fi
 
@@ -283,7 +356,7 @@ function claude-mergerc() {
   local dir f
   for dir in "${fragment_dirs[@]}"; do
     if [[ ! -d "$dir" ]]; then
-      echo "warning: skipping missing fragments dir: $dir" >&2
+      _claude_mergerc_warn "skipping missing fragments dir: $dir"
       continue
     fi
     dir_files=()
@@ -294,7 +367,7 @@ function claude-mergerc() {
   done
 
   if (( ${#fragment_files[@]} == 0 )); then
-    echo "error: no matching fragments found" >&2
+    _claude_mergerc_err "no matching fragments found"
     echo "       dirs:    ${(j/, /)fragment_dirs}" >&2
     echo "       include: ${(j/, /)include_patterns}" >&2
     (( ${#exclude_patterns[@]} )) && echo "       exclude: ${(j/, /)exclude_patterns}" >&2
@@ -314,14 +387,14 @@ function claude-mergerc() {
   # Expand $workdir now: function-scoped EXIT traps run after locals are gone.
   trap "rm -rf ${(q)workdir}" EXIT
 
-  echo "Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)..."
+  echo "${c_dim}Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)...${c_reset}"
 
   local merged_json="$workdir/from-fragments.json"
   _claude_mergerc_merge "$merged_json" "${fragment_files[@]}"
 
   if [[ "$mode" != apply ]]; then
     if [[ ! -e "$output" ]]; then
-      echo "error: $output does not exist; nothing to check for drift" >&2
+      _claude_mergerc_err "$output does not exist; nothing to check for drift"
       return 1
     fi
     _claude_mergerc_drift "$mode"
@@ -340,9 +413,9 @@ function claude-mergerc() {
     echo "No existing settings.json found. Will create new."
     echo ""
     if (( yaml_mode )); then
-      cat "$merged_yaml"
+      _claude_mergerc_print_config "$merged_yaml"
     else
-      jq '.' "$merged_json"
+      _claude_mergerc_print_config "$merged_json"
     fi
     echo ""
     if ! _claude_mergerc_ask_yn "Create $output? [y/n] "; then
@@ -351,7 +424,7 @@ function claude-mergerc() {
     fi
     mkdir -p "$(dirname "$output")"
     cp "$merged_json" "$output"
-    echo "Created $output"
+    echo "${c_green}Created${c_reset} $output"
     return 0
   fi
 
@@ -360,7 +433,7 @@ function claude-mergerc() {
   merged_normalized=$(jq -S '.' "$merged_json")
 
   if [[ "$existing_normalized" == "$merged_normalized" ]]; then
-    echo "No changes. Settings are already in sync."
+    echo "${c_green}No changes.${c_reset} Settings are already in sync."
     return 0
   fi
 
@@ -381,21 +454,21 @@ function claude-mergerc() {
     jq -S '.' "$merged_json" > "$diff_merged"
   fi
 
-  echo "Differences found:\n"
+  echo "${c_bold}Differences found:${c_reset}\n"
 
-  _claude_mergerc_show_diff "$diff_current" "$diff_merged"
+  _claude_mergerc_diff "$diff_current" "$diff_merged" "settings.json (current)" "from fragments"
 
   local format=JSON
   if (( yaml_mode )); then format=YAML; fi
   echo ""
-  echo "  [a] Apply merged config (overwrites current)"
-  echo "  [b] Backup current, then apply"
+  echo "  $(_claude_mergerc_key a) Apply merged config (overwrites current)"
+  echo "  $(_claude_mergerc_key b) Backup current, then apply"
   if (( yaml_mode )); then
-    echo "  [e] Manual merge in \$EDITOR as YAML (edit 'to-apply', pull from 'from-fragments')"
+    echo "  $(_claude_mergerc_key e) Manual merge in \$EDITOR as YAML (edit 'to-apply', pull from 'from-fragments')"
   else
-    echo "  [e] Manual merge in \$EDITOR (edit 'to-apply', pull from 'from-fragments')"
+    echo "  $(_claude_mergerc_key e) Manual merge in \$EDITOR (edit 'to-apply', pull from 'from-fragments')"
   fi
-  echo "  [q] Quit, no changes"
+  echo "  $(_claude_mergerc_key q) Quit, no changes"
   echo ""
   local choice
   if ! _claude_mergerc_ask_key choice "Choose [a/b/e/q]: " abeq; then
@@ -406,14 +479,14 @@ function claude-mergerc() {
   case "$choice" in
     a)
       cp "$merged_json" "$output"
-      echo "Applied merged config to $output"
+      echo "${c_green}Applied${c_reset} merged config to $output"
       ;;
     b)
       local backup="${output}.bak.$(date +%Y%m%d%H%M%S)"
       cp "$output" "$backup"
       cp "$merged_json" "$output"
-      echo "Backup → $backup"
-      echo "Applied merged config to $output"
+      echo "${c_dim}Backup → $backup${c_reset}"
+      echo "${c_green}Applied${c_reset} merged config to $output"
       ;;
     e)
       # Buffer names signal intent: "to-apply" is seeded from the current
@@ -442,9 +515,9 @@ function claude-mergerc() {
         fi
         if (( valid )); then break; fi
         # Your edits are kept: editing again reopens them.
-        echo "error: the result is not valid $format." >&2
+        _claude_mergerc_err "the result is not valid $format."
         if ! _claude_mergerc_ask_key again \
-            "  [e] Edit again  [q] Quit, no changes: " eq; then
+            "  $(_claude_mergerc_key e) Edit again  $(_claude_mergerc_key q) Quit, no changes: " eq; then
           again=q
         fi
         if [[ "$again" == q ]]; then
@@ -457,7 +530,7 @@ function claude-mergerc() {
         return 0
       fi
       cp "$apply_json" "$output"
-      echo "Applied manually merged config."
+      echo "${c_green}Applied${c_reset} manually merged config."
       ;;
     q)
       echo "No changes made."
@@ -671,11 +744,11 @@ function _claude_mergerc_drift_new_file() {
       fi
     done
     if [[ -z "$match" ]]; then
-      echo "  ✗ It must be inside a fragments dir: ${(j/, /)fragment_dirs}"
+      echo "  ${c_red}✗${c_reset} It must be inside a fragments dir: ${(j/, /)fragment_dirs}"
       continue
     fi
     if ! _claude_mergerc_matches "${match:t}"; then
-      echo "  ✗ ${match:t} doesn't match the include/exclude patterns, so it would never be merged"
+      echo "  ${c_red}✗${c_reset} ${match:t} doesn't match the include/exclude patterns, so it would never be merged"
       continue
     fi
     found=""
@@ -688,7 +761,7 @@ function _claude_mergerc_drift_new_file() {
       return 0
     fi
     if [[ -e "$abs" ]]; then
-      echo "  ✗ $(_claude_mergerc_tilde "$abs") already exists but isn't a fragment"
+      echo "  ${c_red}✗${c_reset} $(_claude_mergerc_tilde "$abs") already exists but isn't a fragment"
       continue
     fi
     new_files+=("$match")
@@ -711,11 +784,11 @@ function _claude_mergerc_drift_choose() {
       for f in "${cands[@]}"; do
         i=$((i + 1))
         note=""
-        if [[ "$i" == "$def" ]]; then note="  (default)"; fi
-        echo "    [$i] $(_claude_mergerc_tilde "$f")$note"
+        if [[ "$i" == "$def" ]]; then note="  ${c_dim}(default)${c_reset}"; fi
+        echo "    $(_claude_mergerc_key $i) $(_claude_mergerc_tilde "$f")$note"
       done
-      echo "    [n] a new fragment file"
-      echo "    [c] go back   [s] skip this item for now"
+      echo "    $(_claude_mergerc_key n) a new fragment file"
+      echo "    $(_claude_mergerc_key c) go back   $(_claude_mergerc_key s) skip this item for now"
       show=0
     fi
     if ! _claude_mergerc_ask_line sel "  Choose [$def]: "; then return 1; fi
@@ -737,7 +810,7 @@ function _claude_mergerc_drift_choose() {
         fi
         ;;
     esac
-    echo "  No option \"$sel\". Pick one of the options above."
+    echo "  ${c_yellow}No option \"$sel\". Pick one of the options above.${c_reset}"
   done
 }
 
@@ -767,7 +840,7 @@ function _claude_mergerc_drift_adopt() {
       if ! _claude_mergerc_drift_edit "$target" "$op" "$p" "$v" \
           || ! _claude_mergerc_drift_verify "$item"; then
         _claude_mergerc_drift_restore
-        echo "  ✗ Adding it to $(_claude_mergerc_tilde "$target") wouldn't take effect (a later fragment overrides it). Pick another file."
+        echo "  ${c_red}✗${c_reset} Adding it to $(_claude_mergerc_tilde "$target") wouldn't take effect (a later fragment overrides it). Pick another file."
         return 1
       fi
       REPLY="adopted into $(_claude_mergerc_tilde "$target")"
@@ -786,7 +859,7 @@ function _claude_mergerc_drift_adopt() {
       echo "  Adopting removes it from:"
       for f in "${targets[@]}"; do echo "    $(_claude_mergerc_tilde "$f")"; done
       if ! _claude_mergerc_ask_key answer \
-          "  Proceed? [y] yes  [n] go back  [s] skip for now: " yns; then
+          "  Proceed? $(_claude_mergerc_key y) yes  $(_claude_mergerc_key n) go back  $(_claude_mergerc_key s) skip for now: " yns; then
         return 1
       fi
       case "$answer" in
@@ -798,13 +871,13 @@ function _claude_mergerc_drift_adopt() {
       for f in "${targets[@]}"; do
         if ! _claude_mergerc_drift_edit "$f" "$op" "$p" "$v"; then
           _claude_mergerc_drift_restore
-          echo "  ✗ Couldn't edit $(_claude_mergerc_tilde "$f")"
+          echo "  ${c_red}✗${c_reset} Couldn't edit $(_claude_mergerc_tilde "$f")"
           return 1
         fi
       done
       if ! _claude_mergerc_drift_verify "$item"; then
         _claude_mergerc_drift_restore
-        echo "  ✗ The fragments would still provide it after removal; leaving it alone."
+        echo "  ${c_red}✗${c_reset} The fragments would still provide it after removal; leaving it alone."
         return 1
       fi
       REPLY="adopted (removed from ${#targets} fragment(s))"
@@ -835,47 +908,47 @@ function _claude_mergerc_drift_show() {
     array-add)    label="list entry only in settings.json" ;;
     array-remove) label="list entry missing from settings.json" ;;
   esac
-  echo "[$n/$total] $ps — $label"
+  echo "${c_bold}[$n/$total] $ps${c_reset} ${c_dim}— $label${c_reset}"
   case "$kind" in
     changed)
       _claude_mergerc_drift_select 'haspath($p)' "$p"
       src=""
       if (( ${#reply} )); then src="  (from ${reply[-1]:t})"; fi
-      echo "    settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")"
-      echo "    fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")$src"
+      echo "    ${c_green}settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")${c_reset}"
+      echo "    ${c_red}fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")${c_reset}${c_dim}$src${c_reset}"
       ;;
     added)
-      echo "    settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")"
+      echo "    ${c_green}settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")${c_reset}"
       ;;
     removed)
       _claude_mergerc_drift_select 'haspath($p)' "$p"
-      echo "    fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")  (from ${(j/, /)${reply[@]:t}})"
+      echo "    ${c_red}fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")${c_reset}  ${c_dim}(from ${(j/, /)${reply[@]:t}})${c_reset}"
       ;;
     array-add)
-      echo "    entry: $(_claude_mergerc_drift_fmt "$(jq -c '.value' <<< "$item")")"
+      echo "    ${c_green}entry: $(_claude_mergerc_drift_fmt "$(jq -c '.value' <<< "$item")")${c_reset}"
       ;;
     array-remove)
       local v
       v=$(jq -c '.value' <<< "$item")
       _claude_mergerc_drift_select '(arrayat($p) // []) | any(.[]; . == $v)' "$p" "$v"
-      echo "    entry: $(_claude_mergerc_drift_fmt "$v")  (from ${(j/, /)${reply[@]:t}})"
+      echo "    ${c_red}entry: $(_claude_mergerc_drift_fmt "$v")${c_reset}  ${c_dim}(from ${(j/, /)${reply[@]:t}})${c_reset}"
       ;;
   esac
 }
 
 # Print a one-line summary per item in file $1.
 function _claude_mergerc_drift_list() {
-  jq -r "$jqlib"'
+  jq -r --arg r "$c_red" --arg g "$c_green" --arg y "$c_yellow" --arg z "$c_reset" "$jqlib"'
     def short: tojson | if length > 60 then .[:57] + "..." else . end;
     (.path | pathstr) as $ps
-    | if .kind == "changed" then "  ~ \($ps): \(.merged | short) → \(.current | short)"
-      elif .kind == "added" then "  + \($ps): \(.current | short)"
-      elif .kind == "removed" then "  - \($ps): \(.merged | short)"
-      elif .kind == "array-add" then "  + \($ps)[]: \(.value | short)"
-      else "  - \($ps)[]: \(.value | short)"
+    | if .kind == "changed" then "  \($y)~ \($ps): \(.merged | short) → \(.current | short)\($z)"
+      elif .kind == "added" then "  \($g)+ \($ps): \(.current | short)\($z)"
+      elif .kind == "removed" then "  \($r)- \($ps): \(.merged | short)\($z)"
+      elif .kind == "array-add" then "  \($g)+ \($ps)[]: \(.value | short)\($z)"
+      else "  \($r)- \($ps)[]: \(.value | short)\($z)"
       end' "$1"
   echo ""
-  echo "  (+ only in settings.json   - only in fragments   ~ fragments → settings.json)"
+  echo "  ${c_dim}(${c_reset}${c_green}+${c_reset}${c_dim} only in settings.json   ${c_reset}${c_red}-${c_reset}${c_dim} only in fragments   ${c_reset}${c_yellow}~${c_reset}${c_dim} fragments → settings.json)${c_reset}"
 }
 
 # Show the staged change to one file: live (or nothing) vs staged, labelled
@@ -883,14 +956,8 @@ function _claude_mergerc_drift_list() {
 function _claude_mergerc_drift_show_change() {
   local label="$1" before="$2" after="$3"
   echo ""
-  echo "── $label"
-  if command -v delta &>/dev/null; then
-    diff -u --label "$label" --label "$label" "$before" "$after" | delta --pager=never || true
-  elif command -v colordiff &>/dev/null; then
-    diff -u --label "$label" --label "$label" "$before" "$after" | colordiff || true
-  else
-    diff --color=auto -u --label "$label" --label "$label" "$before" "$after" || true
-  fi
+  echo "${c_bold}── $label${c_reset}"
+  _claude_mergerc_diff "$before" "$after" "$label" "$label"
 }
 
 # Undo history: before deciding the item at queue position N, save the staging
@@ -921,7 +988,7 @@ function _claude_mergerc_drift_undo() {
   local -a parts
   pos=$((pos - 1))
   parts=("${(@ps:\t:)decisions[$pos]}")
-  echo "  ↶ Undid: ${parts[3]}"
+  echo "  ${c_yellow}↶ Undid:${c_reset} ${parts[3]}"
   _claude_mergerc_drift_load "$pos"
   decisions=("${(@)decisions[1,pos-1]}")
   while (( ${#passes} )) && (( pos <= passes[-1] )); do
@@ -942,11 +1009,11 @@ function _claude_mergerc_drift() {
   items=(${(f)"$(<"$items_file")"})
 
   if (( ${#items} == 0 )); then
-    echo "No drift: settings.json matches the fragments."
+    echo "${c_green}No drift:${c_reset} settings.json matches the fragments."
     return 0
   fi
 
-  echo "Drift: ${#items} item(s) where settings.json differs from the fragments:"
+  echo "${c_bold}Drift: ${#items} item(s)${c_reset} where settings.json differs from the fragments:"
   echo ""
   _claude_mergerc_drift_list "$items_file"
 
@@ -968,7 +1035,7 @@ function _claude_mergerc_drift() {
   # pos back and restores the staging area saved before that decision.
   # Skipped items can be appended for another pass; passes[] remembers the
   # queue length before each append so undo can take the append back too.
-  local total=${#items} pos=1 idx item choice ps rc keys prompt rec type text
+  local total=${#items} pos=1 idx item choice ps rc keys prompt rec type text color
   local adopted reverted left settings_changed before after remaining f
   local -a queue decisions passes skipped parts changed_frags
   queue=({1..$total})
@@ -982,17 +1049,17 @@ function _claude_mergerc_drift() {
         ' <<< "$item")
       echo ""
       _claude_mergerc_drift_show "$idx" "$total" "$item"
-      if (( pos > total )); then echo "    (skipped earlier)"; fi
+      if (( pos > total )); then echo "    ${c_dim}(skipped earlier)${c_reset}"; fi
       _claude_mergerc_drift_save "$pos"
 
       keys=aris
-      prompt="  [a]dopt  [r]evert  [i]gnore  [s]kip for now"
+      prompt="  $(_claude_mergerc_key a)dopt  $(_claude_mergerc_key r)evert  $(_claude_mergerc_key i)gnore  $(_claude_mergerc_key s)kip for now"
       if (( pos > 1 )); then
         keys+=u
-        prompt+="  [u]ndo previous"
+        prompt+="  $(_claude_mergerc_key u)ndo previous"
       fi
       keys+=q
-      prompt+="  [q]uit: "
+      prompt+="  $(_claude_mergerc_key q)uit: "
 
       while true; do
         if ! _claude_mergerc_ask_key choice "$prompt" "$keys"; then choice=eof; fi
@@ -1005,7 +1072,7 @@ function _claude_mergerc_drift() {
             elif (( rc == 2 )); then
               choice=s
               decisions[$pos]="skip"$'\t'"$idx"$'\t'"$ps: skipped"
-              echo "  Skipped for now; you'll be offered it again at the end."
+              echo "  ${c_dim}Skipped for now; you'll be offered it again at the end.${c_reset}"
               break
             fi
             # rc 1: went back; ask about this item again.
@@ -1021,7 +1088,7 @@ function _claude_mergerc_drift() {
             ;;
           s)
             decisions[$pos]="skip"$'\t'"$idx"$'\t'"$ps: skipped"
-            echo "  Skipped for now; you'll be offered it again at the end."
+            echo "  ${c_dim}Skipped for now; you'll be offered it again at the end.${c_reset}"
             break
             ;;
           u)
@@ -1073,16 +1140,21 @@ function _claude_mergerc_drift() {
     fi
 
     echo ""
-    echo "Decisions:"
+    echo "${c_bold}Decisions:${c_reset}"
     for idx in {1..$total}; do
-      echo "  ${final_text[$idx]}"
+      case "${final_type[$idx]}" in
+        adopt)  color="$c_green" ;;
+        revert) color="$c_cyan" ;;
+        *)      color="$c_dim" ;;
+      esac
+      echo "  ${color}${final_text[$idx]}${c_reset}"
     done
 
     if (( adopted + reverted == 0 )); then
       echo ""
       echo "Nothing to write: nothing was adopted or reverted."
       if _claude_mergerc_ask_key choice \
-          "  [u]ndo previous  [q]uit: " uq \
+          "  $(_claude_mergerc_key u)ndo previous  $(_claude_mergerc_key q)uit: " uq \
           && [[ "$choice" == u ]]; then
         _claude_mergerc_drift_undo
         continue
@@ -1091,7 +1163,7 @@ function _claude_mergerc_drift() {
     fi
 
     echo ""
-    echo "Staged changes:"
+    echo "${c_bold}Staged changes:${c_reset}"
     settings_changed=0
     if ! cmp -s "$stage_settings" "$workdir/orig/settings.json"; then
       settings_changed=1
@@ -1129,15 +1201,15 @@ function _claude_mergerc_drift() {
     if (( remaining == left )); then
       echo "After writing, $remaining item(s) will still drift (the ones you ignored or skipped)."
     else
-      echo "warning: after writing, $remaining item(s) will still drift, but you left $left as they are." >&2
+      _claude_mergerc_warn "after writing, $remaining item(s) will still drift, but you left $left as they are."
       echo "         Run 'claude-mergerc -c' afterwards to see what's left." >&2
     fi
 
     echo ""
-    echo "  [w] Write changes"
-    echo "  [b] Back up every file it touches, then write"
-    echo "  [u] Undo the last decision and go back"
-    echo "  [q] Quit without writing"
+    echo "  $(_claude_mergerc_key w) Write changes"
+    echo "  $(_claude_mergerc_key b) Back up every file it touches, then write"
+    echo "  $(_claude_mergerc_key u) Undo the last decision and go back"
+    echo "  $(_claude_mergerc_key q) Quit without writing"
     while true; do
       if ! _claude_mergerc_ask_key choice "Choose [w/b/u/q]: " wbuq; then
         echo "Nothing was written."
@@ -1163,17 +1235,17 @@ function _claude_mergerc_drift() {
   # Refuse to write over anything that changed since we read it — Claude Code
   # may have written settings.json while you were deciding.
   if ! cmp -s "$output" "$workdir/orig/settings.json"; then
-    echo "error: $output changed while you were reviewing. Nothing was written; run again." >&2
+    _claude_mergerc_err "$output changed while you were reviewing. Nothing was written; run again."
     return 1
   fi
   for f in "${changed_frags[@]}"; do
     if [[ -n "${origs[$f]:-}" ]]; then
       if ! cmp -s "$f" "${origs[$f]}"; then
-        echo "error: $f changed while you were reviewing. Nothing was written; run again." >&2
+        _claude_mergerc_err "$f changed while you were reviewing. Nothing was written; run again."
         return 1
       fi
     elif [[ -e "$f" ]]; then
-      echo "error: $f appeared while you were reviewing. Nothing was written; run again." >&2
+      _claude_mergerc_err "$f appeared while you were reviewing. Nothing was written; run again."
       return 1
     fi
   done
@@ -1183,19 +1255,19 @@ function _claude_mergerc_drift() {
   for f in "${changed_frags[@]}"; do
     if [[ "$choice" == b && -e "$f" ]]; then
       cp "$f" "$f.bak.$ts"
-      echo "Backup → $f.bak.$ts"
+      echo "${c_dim}Backup → $f.bak.$ts${c_reset}"
     fi
     mkdir -p "${f:h}"
     cp "${staged[$f]}" "$f"
-    echo "Wrote $f"
+    echo "${c_green}Wrote${c_reset} $f"
   done
   if (( settings_changed )); then
     if [[ "$choice" == b ]]; then
       cp "$output" "$output.bak.$ts"
-      echo "Backup → $output.bak.$ts"
+      echo "${c_dim}Backup → $output.bak.$ts${c_reset}"
     fi
     cp "$stage_settings" "$output"
-    echo "Wrote $output"
+    echo "${c_green}Wrote${c_reset} $output"
   fi
 }
 
