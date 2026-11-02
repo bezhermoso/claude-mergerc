@@ -5,9 +5,19 @@
 
 function _claude_mergerc_usage() {
   cat <<'EOF'
-Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
+Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-c | -D] [-h]
 
 Merge Claude Code settings fragments into ~/.claude/settings.json.
+
+Modes:
+  (default) Show a diff of settings.json vs the merged fragments, then apply.
+  -c        Check for drift: list every place settings.json differs from the
+            merged fragments. Changes nothing. Exits 1 if there is drift.
+  -D        Resolve drift interactively, one item at a time:
+              adopt  - keep the settings.json value and write it into a fragment
+              revert - restore the value the fragments resolve to
+              ignore - leave it as is
+            All changes are staged; nothing is written until you confirm.
 
 Options:
   -d DIR    Fragments directory (repeatable). Extends CLAUDE_MERGERC_FRAGMENTS_DIR.
@@ -49,12 +59,134 @@ function _claude_mergerc_require_yq() {
   fi
 }
 
+# Shared jq definitions: the merge itself, plus the drift model.
+function _claude_mergerc_jqlib() {
+  cat <<'EOF'
+def deep_merge(a; b):
+  a as $a | b as $b |
+  if ($a | type) == "object" and ($b | type) == "object" then
+    ($a | keys) + ($b | keys) | unique | map(
+      . as $k |
+      if ($a | has($k)) and ($b | has($k)) then
+        {($k): deep_merge($a[$k]; $b[$k])}
+      elif ($b | has($k)) then {($k): $b[$k]}
+      else {($k): $a[$k]}
+      end
+    ) | add // {}
+  elif ($a | type) == "array" and ($b | type) == "array" then
+    $a + $b | unique
+  else $b
+  end;
+
+# Arrays merge as sets, so compare them as sets.
+def canon: walk(if type == "array" then unique else . end);
+
+def pathstr:
+  if length == 0 then "."
+  else map(
+    if type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$") then "." + .
+    else "[" + tojson + "]"
+    end) | join("")
+  end;
+
+def haspath($p):
+  if ($p | length) == 0 then true
+  else try (getpath($p[:-1]) | type == "object" and has($p[-1])) catch false
+  end;
+
+def arrayat($p): try (getpath($p) | if type == "array" then . else null end) catch null;
+
+# One item per leaf where $c (settings.json) differs from $m (merged
+# fragments). Arrays are treated as sets: each element present on only one
+# side is its own item.
+def drift_items($c; $m; $p):
+  if ($c | type) == "object" and ($m | type) == "object" then
+    (($c | keys) + ($m | keys) | unique)[] as $k
+    | if ($c | has($k)) and ($m | has($k)) then drift_items($c[$k]; $m[$k]; $p + [$k])
+      elif ($c | has($k)) then {kind: "added", path: ($p + [$k]), current: $c[$k]}
+      else {kind: "removed", path: ($p + [$k]), merged: $m[$k]}
+      end
+  elif ($c | type) == "array" and ($m | type) == "array" then
+    (($c | unique)[] as $e | select(any($m[]; . == $e) | not)
+      | {kind: "array-add", path: $p, value: $e}),
+    (($m | unique)[] as $e | select(any($c[]; . == $e) | not)
+      | {kind: "array-remove", path: $p, value: $e})
+  elif $c == $m then empty
+  else {kind: "changed", path: $p, current: $c, merged: $m}
+  end;
+
+# Given a merged config as input, is item $i no longer drifting if
+# settings.json keeps its current value?
+def resolved($i):
+  if $i.kind == "changed" or $i.kind == "added" then
+    haspath($i.path) and ((getpath($i.path) | canon) == ($i.current | canon))
+  elif $i.kind == "removed" then haspath($i.path) | not
+  elif $i.kind == "array-add" then (arrayat($i.path) // []) | any(.[]; . == $i.value)
+  else (arrayat($i.path) // []) | any(.[]; . == $i.value) | not
+  end;
+EOF
+}
+
+# Print a fragment as JSON. An empty YAML file reads as {} rather than null.
+function _claude_mergerc_to_json() {
+  if [[ "$1" == *.(yaml|yml) ]]; then
+    yq -o=json '. // {}' "$1"
+  else
+    jq '.' "$1"
+  fi
+}
+
+# _claude_mergerc_merge OUT FILE... — deep-merge fragments (in order) into OUT.
+function _claude_mergerc_merge() {
+  local out="$1"; shift
+  local -a inputs
+  local f n=0 converted
+  for f in "$@"; do
+    if [[ "$f" == *.(yaml|yml) ]]; then
+      converted="${out:h}/.yaml-to-json-$((++n)).json"
+      if ! _claude_mergerc_to_json "$f" > "$converted"; then
+        echo "error: failed to parse YAML fragment: $f" >&2
+        return 1
+      fi
+      inputs+=("$converted")
+    else
+      inputs+=("$f")
+    fi
+  done
+  jq -s "$(_claude_mergerc_jqlib)"' reduce .[] as $item ({}; deep_merge(.; $item))' \
+    "${inputs[@]}" > "$out"
+}
+
+function _claude_mergerc_show_diff() {
+  if command -v delta &>/dev/null; then
+    delta "$1" "$2" --pager=never || true
+  elif command -v colordiff &>/dev/null; then
+    colordiff "$1" "$2" || true
+  else
+    diff --color=auto -u "$1" "$2" || true
+  fi
+}
+
+# Does a fragment basename match the include/exclude patterns in scope?
+function _claude_mergerc_matches() {
+  local fname="$1" pat
+  local included=0
+  for pat in "${include_patterns[@]}"; do
+    if [[ "$fname" == ${~pat} ]]; then included=1; break; fi
+  done
+  (( included )) || return 1
+  for pat in "${exclude_patterns[@]}"; do
+    if [[ "$fname" == ${~pat} ]]; then return 1; fi
+  done
+  return 0
+}
+
 function claude-mergerc() {
   emulate -L zsh
   setopt local_options err_return no_unset pipe_fail
 
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
-  local yaml_mode=0
+  local yaml_mode=0 mode=apply
   [[ "${CLAUDE_MERGERC_YAML:-}" == (1|true|yes) ]] && yaml_mode=1
 
   local -a fragment_dirs include_patterns exclude_patterns
@@ -68,12 +200,14 @@ function claude-mergerc() {
 
   local OPTARG OPTIND opt
   OPTIND=1
-  while getopts ":d:i:x:yh" opt; do
+  while getopts ":d:i:x:ycDh" opt; do
     case "$opt" in
       d) fragment_dirs+=("$OPTARG") ;;
       i) include_patterns+=("$OPTARG") ;;
       x) exclude_patterns+=("$OPTARG") ;;
       y) yaml_mode=1 ;;
+      c) mode=check ;;
+      D) mode=drift ;;
       h) _claude_mergerc_usage; return 0 ;;
       :) echo "error: -$OPTARG requires an argument" >&2; return 1 ;;
       \?) echo "error: unknown option -$OPTARG" >&2; return 1 ;;
@@ -111,7 +245,7 @@ function claude-mergerc() {
   fi
 
   local -a fragment_files dir_files
-  local dir f fname pat included excluded
+  local dir f
   for dir in "${fragment_dirs[@]}"; do
     if [[ ! -d "$dir" ]]; then
       echo "warning: skipping missing fragments dir: $dir" >&2
@@ -119,18 +253,7 @@ function claude-mergerc() {
     fi
     dir_files=()
     for f in "$dir"/**/*(.N); do
-      fname="${f:t}"
-      included=0
-      for pat in "${include_patterns[@]}"; do
-        [[ "$fname" == ${~pat} ]] && { included=1; break; }
-      done
-      (( included )) || continue
-      excluded=0
-      for pat in "${exclude_patterns[@]}"; do
-        [[ "$fname" == ${~pat} ]] && { excluded=1; break; }
-      done
-      (( excluded )) && continue
-      dir_files+=("$f")
+      _claude_mergerc_matches "${f:t}" && dir_files+=("$f")
     done
     fragment_files+=("${(on)dir_files[@]}")
   done
@@ -156,43 +279,19 @@ function claude-mergerc() {
   # Expand $workdir now: function-scoped EXIT traps run after locals are gone.
   trap "rm -rf ${(q)workdir}" EXIT
 
-  # Convert YAML fragments to JSON so jq can merge a uniform stream.
-  local -a merge_inputs
-  local n=0 converted
-  for f in "${fragment_files[@]}"; do
-    if [[ "$f" == *.(yaml|yml) ]]; then
-      converted="$workdir/fragment-$((++n)).json"
-      if ! yq -o=json '.' "$f" > "$converted"; then
-        echo "error: failed to parse YAML fragment: $f" >&2
-        return 1
-      fi
-      merge_inputs+=("$converted")
-    else
-      merge_inputs+=("$f")
-    fi
-  done
-
   echo "Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)..."
 
   local merged_json="$workdir/from-fragments.json"
-  jq -s '
-      def deep_merge(a; b):
-        a as $a | b as $b |
-        if ($a | type) == "object" and ($b | type) == "object" then
-          ($a | keys) + ($b | keys) | unique | map(
-            . as $k |
-            if ($a | has($k)) and ($b | has($k)) then
-              {($k): deep_merge($a[$k]; $b[$k])}
-            elif ($b | has($k)) then {($k): $b[$k]}
-            else {($k): $a[$k]}
-            end
-          ) | add // {}
-        elif ($a | type) == "array" and ($b | type) == "array" then
-          $a + $b | unique
-        else $b
-        end;
-      reduce .[] as $item ({}; deep_merge(.; $item))
-    ' "${merge_inputs[@]}" > "$merged_json"
+  _claude_mergerc_merge "$merged_json" "${fragment_files[@]}"
+
+  if [[ "$mode" != apply ]]; then
+    if [[ ! -e "$output" ]]; then
+      echo "error: $output does not exist; nothing to check for drift" >&2
+      return 1
+    fi
+    _claude_mergerc_drift "$mode"
+    return
+  fi
 
   # In YAML mode, stage the merged config as YAML for diff/editor.
   # YAML is for human eyes only: every path that writes $output writes JSON,
@@ -247,13 +346,7 @@ function claude-mergerc() {
 
   echo "Differences found:\n"
 
-  if command -v delta &>/dev/null; then
-    delta "$diff_current" "$diff_merged" --pager=never || true
-  elif command -v colordiff &>/dev/null; then
-    colordiff "$diff_current" "$diff_merged" || true
-  else
-    diff --color=auto -u "$diff_current" "$diff_merged" || true
-  fi
+  _claude_mergerc_show_diff "$diff_current" "$diff_merged"
 
   echo ""
   echo "  [a] Apply merged config (overwrites current)"
@@ -318,6 +411,574 @@ function claude-mergerc() {
       echo "No changes made."
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Drift: places where settings.json no longer matches the merged fragments,
+# usually because Claude Code wrote to settings.json itself (e.g. "always
+# allow" on a permission prompt).
+#
+# The helpers below share state through zsh's dynamic scoping. They read the
+# locals of claude-mergerc (output, workdir, merged_json, fragment_dirs,
+# fragment_files, include/exclude patterns, yaml_mode) and of
+# _claude_mergerc_drift (jqlib and the staging area).
+#
+# Nothing live is touched until the final confirmation: every decision edits
+# copies under $workdir/stage.
+# ---------------------------------------------------------------------------
+
+function _claude_mergerc_tilde() {
+  print -r -- "${1/#${HOME}/~}"
+}
+
+# Format a JSON value for display: inline if short, else an indented block.
+function _claude_mergerc_drift_fmt() {
+  local compact
+  compact=$(jq -c '.' <<< "$1")
+  if (( ${#compact} <= 72 )); then
+    print -r -- "$compact"
+    return 0
+  fi
+  echo ""
+  if (( yaml_mode )); then
+    yq -p=json -o=yaml -P '.' <<< "$1" | sed 's/^/        /'
+  else
+    jq '.' <<< "$1" | sed 's/^/        /'
+  fi
+}
+
+# Set reply to the fragment list in merge order (live paths), including new
+# files staged during this session.
+function _claude_mergerc_drift_fragments() {
+  local -a all in_dir
+  all=("${fragment_files[@]}" "${new_files[@]}")
+  local dir f
+  reply=()
+  for dir in "${fragment_dirs[@]}"; do
+    in_dir=()
+    for f in "${all[@]}"; do
+      if [[ "$f" == "$dir"/* ]]; then in_dir+=("$f"); fi
+    done
+    reply+=("${(on)in_dir[@]}")
+  done
+}
+
+# Merge the fragments as staged into $1.
+function _claude_mergerc_drift_merge() {
+  local -a srcs
+  local f
+  _claude_mergerc_drift_fragments
+  for f in "${reply[@]}"; do srcs+=("${staged[$f]:-$f}"); done
+  _claude_mergerc_merge "$1" "${srcs[@]}"
+}
+
+# _claude_mergerc_drift_select PRED PATH [VALUE] — set reply to the fragments
+# (as staged) for which the jq predicate PRED is true, with $p and $v bound.
+function _claude_mergerc_drift_select() {
+  local pred="$1" p="$2" v="${3:-null}" f
+  local -a frags
+  _claude_mergerc_drift_fragments
+  frags=("${reply[@]}")
+  reply=()
+  for f in "${frags[@]}"; do
+    if [[ "$(_claude_mergerc_to_json "${staged[$f]:-$f}" \
+        | jq --argjson p "$p" --argjson v "$v" "$jqlib $pred")" == true ]]; then
+      reply+=("$f")
+    fi
+  done
+}
+
+# Set reply to the fragments an additive adoption could go into, best last.
+function _claude_mergerc_drift_candidates() {
+  local kind="$1" p="$2" len L
+  if [[ "$kind" == changed ]]; then
+    # Only the last fragment defining the key wins the merge.
+    _claude_mergerc_drift_select 'haspath($p)' "$p"
+    if (( ${#reply} )); then reply=("${reply[-1]}"); fi
+    return 0
+  fi
+  if [[ "$kind" == array-add ]]; then
+    # Arrays concatenate, so any fragment that defines the list works.
+    _claude_mergerc_drift_select 'arrayat($p) != null' "$p"
+    if (( ${#reply} )); then return 0; fi
+  fi
+  # A new key: offer the fragments that hold its nearest existing parent.
+  len=$(jq 'length' <<< "$p")
+  L=$((len - 1))
+  while (( L >= 0 )); do
+    _claude_mergerc_drift_select \
+      "(\$p | .[:$L]) as \$q | try (getpath(\$q) | type == \"object\") catch false" "$p"
+    if (( ${#reply} )); then return 0; fi
+    L=$((L - 1))
+  done
+  return 0
+}
+
+# Copy a fragment into the staging area (once). Sets REPLY to the copy.
+function _claude_mergerc_drift_stage() {
+  local f="$1" s
+  if [[ -z "${staged[$f]:-}" ]]; then
+    stage_n=$((stage_n + 1))
+    s="$stage_dir/fragment-$stage_n.${f:e}"
+    if [[ -e "$f" ]]; then
+      cp "$f" "$s" || return 1
+      cp "$f" "$workdir/orig/fragment-$stage_n.${f:e}" || return 1
+      origs[$f]="$workdir/orig/fragment-$stage_n.${f:e}"
+    elif [[ "$f" == *.(yaml|yml) ]]; then
+      : > "$s"
+    else
+      echo '{}' > "$s"
+    fi
+    staged[$f]="$s"
+  fi
+  REPLY="${staged[$f]}"
+}
+
+# _claude_mergerc_drift_edit FRAGMENT OP PATH [VALUE] — edit the staged copy.
+# OP: set | append (to a list) | delete | remove-elem (from a list).
+# YAML fragments are edited with yq in place, so comments survive.
+function _claude_mergerc_drift_edit() {
+  local f="$1" op="$2" p="$3" v="${4:-null}" s idx
+  _claude_mergerc_drift_stage "$f" || return 1
+  s="$REPLY"
+  if [[ "$s" == *.(yaml|yml) ]]; then
+    # Values arrive as JSON; drop its flow style so they read as block YAML.
+    local block='(.. | select(tag == "!!map" or tag == "!!seq")) style=""'
+    case "$op" in
+      set)
+        P="$p" V="$v" yq -i "setpath(env(P); env(V) | $block)" "$s" || return 1 ;;
+      append)
+        E="$(jq -r '"." + (map("[" + tojson + "]") | join(""))' <<< "$p")" V="$v" \
+          yq -i "eval(strenv(E)) += [env(V) | $block]" "$s" || return 1 ;;
+      delete)
+        P="$p" yq -i 'delpaths([env(P)])' "$s" || return 1 ;;
+      remove-elem)
+        for idx in ${(f)"$(_claude_mergerc_to_json "$s" | jq --argjson p "$p" --argjson v "$v" \
+            '[getpath($p) | to_entries[] | select(.value == $v) | .key] | reverse | .[]')"}; do
+          P="$(jq -c --argjson i "$idx" '. + [$i]' <<< "$p")" yq -i 'delpaths([env(P)])' "$s" \
+            || return 1
+        done ;;
+    esac
+  else
+    local prog
+    case "$op" in
+      set)         prog='setpath($p; $v)' ;;
+      append)      prog='setpath($p; ((try getpath($p) catch null) // []) + [$v])' ;;
+      delete)      prog='delpaths([$p])' ;;
+      remove-elem) prog='setpath($p; getpath($p) | map(select(. != $v)))' ;;
+    esac
+    jq --argjson p "$p" --argjson v "$v" "$prog" "$s" > "$s.tmp" || return 1
+    mv "$s.tmp" "$s"
+  fi
+}
+
+function _claude_mergerc_drift_snapshot() {
+  rm -rf "$workdir/snapshot"
+  cp -R "$stage_dir" "$workdir/snapshot"
+  snap_staged=("${(@kv)staged}")
+  snap_new=("${new_files[@]}")
+}
+
+function _claude_mergerc_drift_restore() {
+  rm -rf "$stage_dir"
+  mv "$workdir/snapshot" "$stage_dir"
+  staged=("${(@kv)snap_staged}")
+  new_files=("${snap_new[@]}")
+}
+
+# Does item $1 stop drifting once the staged fragments are merged?
+function _claude_mergerc_drift_verify() {
+  _claude_mergerc_drift_merge "$workdir/verify.json" || return 1
+  [[ "$(jq --argjson i "$1" "$jqlib resolved(\$i)" "$workdir/verify.json")" == true ]]
+}
+
+# Prompt for a new fragment file. Sets REPLY to its live path.
+function _claude_mergerc_drift_new_file() {
+  local last_dir="${fragment_dirs[-1]}" ext=json input dir match="" f abs
+  if (( yaml_mode )); then ext=yaml; fi
+  local def="$last_dir/99-adopted.$ext"
+  read -r "input?  New fragment file [$(_claude_mergerc_tilde "$def")]: "
+  if [[ -z "$input" ]]; then input="$def"; fi
+  input="${input/#\~/$HOME}"
+  if [[ "$input" != */* ]]; then input="$last_dir/$input"; fi
+  abs="${input:A}"
+  for dir in "${fragment_dirs[@]}"; do
+    if [[ "$abs" == "${dir:A}"/* ]]; then
+      match="$dir/${abs#${dir:A}/}"
+      break
+    fi
+  done
+  if [[ -z "$match" ]]; then
+    echo "  ✗ It must be inside a fragments dir: ${(j/, /)fragment_dirs}"
+    return 1
+  fi
+  if ! _claude_mergerc_matches "${match:t}"; then
+    echo "  ✗ ${match:t} doesn't match the include/exclude patterns, so it would never be merged"
+    return 1
+  fi
+  _claude_mergerc_drift_fragments
+  for f in "${reply[@]}"; do
+    if [[ "${f:A}" == "$abs" ]]; then REPLY="$f"; return 0; fi
+  done
+  if [[ -e "$abs" ]]; then
+    echo "  ✗ $(_claude_mergerc_tilde "$abs") already exists but isn't a fragment"
+    return 1
+  fi
+  new_files+=("$match")
+  REPLY="$match"
+}
+
+# Choose among the candidates in reply (or a new file). Sets REPLY.
+function _claude_mergerc_drift_choose() {
+  local -a cands
+  cands=("${reply[@]}")
+  local i=0 f sel def="${#cands}" note
+  if (( def == 0 )); then def=n; fi
+  echo "  Adopt into:"
+  for f in "${cands[@]}"; do
+    i=$((i + 1))
+    note=""
+    if [[ "$i" == "$def" ]]; then note="  (default)"; fi
+    echo "    [$i] $(_claude_mergerc_tilde "$f")$note"
+  done
+  echo "    [n] a new fragment file"
+  echo "    [c] cancel"
+  read -r "sel?  Choose [$def]: "
+  if [[ -z "$sel" ]]; then sel="$def"; fi
+  case "$sel" in
+    n) _claude_mergerc_drift_new_file; return ;;
+    c) return 1 ;;
+    <->)
+      if (( sel >= 1 && sel <= ${#cands} )); then
+        REPLY="${cands[$sel]}"
+        return 0
+      fi
+      ;;
+  esac
+  echo "  ✗ Invalid choice"
+  return 1
+}
+
+# Write the settings.json value into the fragments. Returns 1 (with nothing
+# staged) if cancelled or if the change wouldn't take effect.
+function _claude_mergerc_drift_adopt() {
+  local item="$1" kind p v op target f
+  local -a targets
+  kind=$(jq -r '.kind' <<< "$item")
+  p=$(jq -c '.path' <<< "$item")
+  case "$kind" in
+    changed|added|array-add)
+      if [[ "$kind" == array-add ]]; then
+        v=$(jq -c '.value' <<< "$item"); op=append
+      else
+        v=$(jq -c '.current' <<< "$item"); op=set
+      fi
+      _claude_mergerc_drift_candidates "$kind" "$p"
+      _claude_mergerc_drift_snapshot
+      if ! _claude_mergerc_drift_choose; then
+        _claude_mergerc_drift_restore
+        return 1
+      fi
+      target="$REPLY"
+      if ! _claude_mergerc_drift_edit "$target" "$op" "$p" "$v" \
+          || ! _claude_mergerc_drift_verify "$item"; then
+        _claude_mergerc_drift_restore
+        echo "  ✗ Adding it to $(_claude_mergerc_tilde "$target") wouldn't take effect (a later fragment overrides it). Pick another file."
+        return 1
+      fi
+      REPLY="adopted into $(_claude_mergerc_tilde "$target")"
+      ;;
+    removed|array-remove)
+      # The fragments must stop providing it, so it comes out of every
+      # fragment that has it. A new file can't remove anything.
+      if [[ "$kind" == removed ]]; then
+        v=null
+        _claude_mergerc_drift_select 'haspath($p)' "$p"
+      else
+        v=$(jq -c '.value' <<< "$item")
+        _claude_mergerc_drift_select '(arrayat($p) // []) | any(.[]; . == $v)' "$p" "$v"
+      fi
+      targets=("${reply[@]}")
+      echo "  Adopting removes it from:"
+      for f in "${targets[@]}"; do echo "    $(_claude_mergerc_tilde "$f")"; done
+      if ! read -q "?  Proceed? [y/n] "; then echo ""; return 1; fi
+      echo ""
+      if [[ "$kind" == removed ]]; then op=delete; else op=remove-elem; fi
+      _claude_mergerc_drift_snapshot
+      for f in "${targets[@]}"; do
+        if ! _claude_mergerc_drift_edit "$f" "$op" "$p" "$v"; then
+          _claude_mergerc_drift_restore
+          echo "  ✗ Couldn't edit $(_claude_mergerc_tilde "$f")"
+          return 1
+        fi
+      done
+      if ! _claude_mergerc_drift_verify "$item"; then
+        _claude_mergerc_drift_restore
+        echo "  ✗ The fragments would still provide it after removal; leaving it alone."
+        return 1
+      fi
+      REPLY="adopted (removed from ${#targets} fragment(s))"
+      ;;
+  esac
+}
+
+# Put the value the fragments resolve to back into the staged settings.json.
+function _claude_mergerc_drift_revert() {
+  jq --argjson i "$1" '
+    if $i.kind == "changed" or $i.kind == "removed" then setpath($i.path; $i.merged)
+    elif $i.kind == "added" then delpaths([$i.path])
+    elif $i.kind == "array-add" then setpath($i.path; getpath($i.path) | map(select(. != $i.value)))
+    else setpath($i.path; getpath($i.path) + [$i.value])
+    end' "$stage_settings" > "$stage_settings.tmp" || return 1
+  mv "$stage_settings.tmp" "$stage_settings"
+}
+
+function _claude_mergerc_drift_show() {
+  local n="$1" total="$2" item="$3" kind p ps label src
+  kind=$(jq -r '.kind' <<< "$item")
+  p=$(jq -c '.path' <<< "$item")
+  ps=$(jq -r "$jqlib .path | pathstr" <<< "$item")
+  case "$kind" in
+    changed)      label="value changed" ;;
+    added)        label="only in settings.json" ;;
+    removed)      label="missing from settings.json" ;;
+    array-add)    label="list entry only in settings.json" ;;
+    array-remove) label="list entry missing from settings.json" ;;
+  esac
+  echo "[$n/$total] $ps — $label"
+  case "$kind" in
+    changed)
+      _claude_mergerc_drift_select 'haspath($p)' "$p"
+      src=""
+      if (( ${#reply} )); then src="  (from ${reply[-1]:t})"; fi
+      echo "    settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")"
+      echo "    fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")$src"
+      ;;
+    added)
+      echo "    settings.json: $(_claude_mergerc_drift_fmt "$(jq -c '.current' <<< "$item")")"
+      ;;
+    removed)
+      _claude_mergerc_drift_select 'haspath($p)' "$p"
+      echo "    fragments:     $(_claude_mergerc_drift_fmt "$(jq -c '.merged' <<< "$item")")  (from ${(j/, /)${reply[@]:t}})"
+      ;;
+    array-add)
+      echo "    entry: $(_claude_mergerc_drift_fmt "$(jq -c '.value' <<< "$item")")"
+      ;;
+    array-remove)
+      local v
+      v=$(jq -c '.value' <<< "$item")
+      _claude_mergerc_drift_select '(arrayat($p) // []) | any(.[]; . == $v)' "$p" "$v"
+      echo "    entry: $(_claude_mergerc_drift_fmt "$v")  (from ${(j/, /)${reply[@]:t}})"
+      ;;
+  esac
+}
+
+# Print a one-line summary per item in file $1.
+function _claude_mergerc_drift_list() {
+  jq -r "$jqlib"'
+    def short: tojson | if length > 60 then .[:57] + "..." else . end;
+    (.path | pathstr) as $ps
+    | if .kind == "changed" then "  ~ \($ps): \(.merged | short) → \(.current | short)"
+      elif .kind == "added" then "  + \($ps): \(.current | short)"
+      elif .kind == "removed" then "  - \($ps): \(.merged | short)"
+      elif .kind == "array-add" then "  + \($ps)[]: \(.value | short)"
+      else "  - \($ps)[]: \(.value | short)"
+      end' "$1"
+  echo ""
+  echo "  (+ only in settings.json   - only in fragments   ~ fragments → settings.json)"
+}
+
+# Show the staged change to one file: live (or nothing) vs staged, labelled
+# with the live path rather than the staging copies.
+function _claude_mergerc_drift_show_change() {
+  local label="$1" before="$2" after="$3"
+  echo ""
+  echo "── $label"
+  if command -v delta &>/dev/null; then
+    diff -u --label "$label" --label "$label" "$before" "$after" | delta --pager=never || true
+  elif command -v colordiff &>/dev/null; then
+    diff -u --label "$label" --label "$label" "$before" "$after" | colordiff || true
+  else
+    diff --color=auto -u --label "$label" --label "$label" "$before" "$after" || true
+  fi
+}
+
+function _claude_mergerc_drift() {
+  local mode="$1"
+  local jqlib
+  jqlib=$(_claude_mergerc_jqlib)
+
+  local items_file="$workdir/drift.jsonl"
+  jq -c -n --slurpfile c "$output" --slurpfile m "$merged_json" \
+    "$jqlib drift_items(\$c[0]; \$m[0]; [])" > "$items_file"
+  local -a items
+  items=(${(f)"$(<"$items_file")"})
+
+  if (( ${#items} == 0 )); then
+    echo "No drift: settings.json matches the fragments."
+    return 0
+  fi
+
+  echo "Drift: ${#items} item(s) where settings.json differs from the fragments:"
+  echo ""
+  _claude_mergerc_drift_list "$items_file"
+
+  if [[ "$mode" == check ]]; then
+    return 1
+  fi
+
+  local stage_dir="$workdir/stage"
+  local stage_settings="$stage_dir/settings.json"
+  local stage_n=0
+  local -A staged snap_staged origs
+  local -a new_files snap_new decisions
+  mkdir -p "$stage_dir" "$workdir/orig"
+  cp "$output" "$stage_settings"
+  cp "$output" "$workdir/orig/settings.json"
+
+  local n=0 item choice ps adopted=0 reverted=0 ignored=0
+  for item in "${items[@]}"; do
+    n=$((n + 1))
+    ps=$(jq -r "$jqlib"'
+      (.path | pathstr) + (if .kind | startswith("array-") then "[] \(.value | tojson)" else "" end)
+      ' <<< "$item")
+    echo ""
+    _claude_mergerc_drift_show "$n" "${#items}" "$item"
+    while true; do
+      read -k 1 "choice?  [a]dopt  [r]evert  [i]gnore  [q]uit: "
+      echo ""
+      case "$choice" in
+        a)
+          if _claude_mergerc_drift_adopt "$item"; then
+            decisions+=("$ps: $REPLY")
+            adopted=$((adopted + 1))
+            break
+          fi
+          ;;
+        r)
+          _claude_mergerc_drift_revert "$item"
+          decisions+=("$ps: reverted to the fragments' value")
+          reverted=$((reverted + 1))
+          break
+          ;;
+        i)
+          decisions+=("$ps: ignored")
+          ignored=$((ignored + 1))
+          break
+          ;;
+        q)
+          echo "Quit. Nothing was written."
+          return 0
+          ;;
+        *)
+          echo "  Choose a, r, i, or q."
+          ;;
+      esac
+    done
+  done
+
+  echo ""
+  if (( adopted + reverted == 0 )); then
+    echo "Nothing to write: every item was ignored."
+    return 0
+  fi
+
+  echo "Decisions:"
+  print -rl -- "  "${^decisions}
+
+  echo ""
+  echo "Staged changes:"
+  local settings_changed=0
+  if ! cmp -s "$stage_settings" "$workdir/orig/settings.json"; then
+    settings_changed=1
+    local before="$workdir/review/settings.before" after="$workdir/review/settings.after"
+    mkdir -p "$workdir/review"
+    if (( yaml_mode )); then
+      yq -p=json -o=yaml -P 'sort_keys(..)' "$workdir/orig/settings.json" > "$before.yaml"
+      yq -p=json -o=yaml -P 'sort_keys(..)' "$stage_settings" > "$after.yaml"
+      before+=.yaml after+=.yaml
+    else
+      jq -S '.' "$workdir/orig/settings.json" > "$before.json"
+      jq -S '.' "$stage_settings" > "$after.json"
+      before+=.json after+=.json
+    fi
+    _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$output")" "$before" "$after"
+  fi
+
+  local -a changed_frags
+  local f
+  _claude_mergerc_drift_fragments
+  for f in "${reply[@]}"; do
+    if [[ -z "${staged[$f]:-}" ]]; then continue; fi
+    if [[ -n "${origs[$f]:-}" ]]; then
+      if cmp -s "${origs[$f]}" "${staged[$f]}"; then continue; fi
+      _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f")" "${origs[$f]}" "${staged[$f]}"
+    else
+      _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f") (new file)" /dev/null "${staged[$f]}"
+    fi
+    changed_frags+=("$f")
+  done
+
+  local remaining
+  _claude_mergerc_drift_merge "$workdir/final.json"
+  remaining=$(jq -n --slurpfile c "$stage_settings" --slurpfile m "$workdir/final.json" \
+    "$jqlib [drift_items(\$c[0]; \$m[0]; [])] | length")
+  echo ""
+  if (( remaining == ignored )); then
+    echo "After writing, $remaining item(s) will still drift (the ones you ignored)."
+  else
+    echo "warning: after writing, $remaining item(s) will still drift, but you ignored $ignored." >&2
+    echo "         Run 'claude-mergerc -c' afterwards to see what's left." >&2
+  fi
+
+  echo ""
+  echo "  [w] Write changes"
+  echo "  [b] Back up every file it touches, then write"
+  echo "  [q] Quit without writing"
+  read -k 1 "choice?Choose [w/b/q]: "
+  echo ""
+  if [[ "$choice" != (w|b) ]]; then
+    echo "Nothing was written."
+    return 0
+  fi
+
+  # Refuse to write over anything that changed since we read it — Claude Code
+  # may have written settings.json while you were deciding.
+  if ! cmp -s "$output" "$workdir/orig/settings.json"; then
+    echo "error: $output changed while you were reviewing. Nothing was written; run again." >&2
+    return 1
+  fi
+  for f in "${changed_frags[@]}"; do
+    if [[ -n "${origs[$f]:-}" ]]; then
+      if ! cmp -s "$f" "${origs[$f]}"; then
+        echo "error: $f changed while you were reviewing. Nothing was written; run again." >&2
+        return 1
+      fi
+    elif [[ -e "$f" ]]; then
+      echo "error: $f appeared while you were reviewing. Nothing was written; run again." >&2
+      return 1
+    fi
+  done
+
+  local ts
+  ts=$(date +%Y%m%d%H%M%S)
+  for f in "${changed_frags[@]}"; do
+    if [[ "$choice" == b && -e "$f" ]]; then
+      cp "$f" "$f.bak.$ts"
+      echo "Backup → $f.bak.$ts"
+    fi
+    mkdir -p "${f:h}"
+    cp "${staged[$f]}" "$f"
+    echo "Wrote $f"
+  done
+  if (( settings_changed )); then
+    if [[ "$choice" == b ]]; then
+      cp "$output" "$output.bak.$ts"
+      echo "Backup → $output.bak.$ts"
+    fi
+    cp "$stage_settings" "$output"
+    echo "Wrote $output"
+  fi
 }
 
 # On first invocation, zsh's native autoload executes this file's body — which
