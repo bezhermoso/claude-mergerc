@@ -5,9 +5,14 @@
 
 function _claude_mergerc_usage() {
   cat <<'EOF'
-Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
+Usage: claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-c] [-h]
 
 Merge Claude Code settings fragments into ~/.claude/settings.json.
+
+Modes:
+  (default) Show a diff of settings.json vs the merged fragments, then apply.
+  -c        Check for drift: list every place settings.json differs from the
+            merged fragments. Changes nothing. Exits 1 if there is drift.
 
 Options:
   -d DIR    Fragments directory (repeatable). Extends CLAUDE_MERGERC_FRAGMENTS_DIR.
@@ -49,7 +54,7 @@ function _claude_mergerc_require_yq() {
   fi
 }
 
-# Shared jq definitions.
+# Shared jq definitions: the merge itself, plus the drift model.
 function _claude_mergerc_jqlib() {
   cat <<'EOF'
 def deep_merge(a; b):
@@ -66,6 +71,43 @@ def deep_merge(a; b):
   elif ($a | type) == "array" and ($b | type) == "array" then
     $a + $b | unique
   else $b
+  end;
+
+# Arrays merge as sets, so compare them as sets.
+def canon: walk(if type == "array" then unique else . end);
+
+def pathstr:
+  if length == 0 then "."
+  else map(
+    if type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$") then "." + .
+    else "[" + tojson + "]"
+    end) | join("")
+  end;
+
+def haspath($p):
+  if ($p | length) == 0 then true
+  else try (getpath($p[:-1]) | type == "object" and has($p[-1])) catch false
+  end;
+
+def arrayat($p): try (getpath($p) | if type == "array" then . else null end) catch null;
+
+# One item per leaf where $c (settings.json) differs from $m (merged
+# fragments). Arrays are treated as sets: each element present on only one
+# side is its own item.
+def drift_items($c; $m; $p):
+  if ($c | type) == "object" and ($m | type) == "object" then
+    (($c | keys) + ($m | keys) | unique)[] as $k
+    | if ($c | has($k)) and ($m | has($k)) then drift_items($c[$k]; $m[$k]; $p + [$k])
+      elif ($c | has($k)) then {kind: "added", path: ($p + [$k]), current: $c[$k]}
+      else {kind: "removed", path: ($p + [$k]), merged: $m[$k]}
+      end
+  elif ($c | type) == "array" and ($m | type) == "array" then
+    (($c | unique)[] as $e | select(any($m[]; . == $e) | not)
+      | {kind: "array-add", path: $p, value: $e}),
+    (($m | unique)[] as $e | select(any($c[]; . == $e) | not)
+      | {kind: "array-remove", path: $p, value: $e})
+  elif $c == $m then empty
+  else {kind: "changed", path: $p, current: $c, merged: $m}
   end;
 
 EOF
@@ -130,7 +172,7 @@ function claude-mergerc() {
   setopt local_options err_return no_unset pipe_fail
 
   local output="${CLAUDE_MERGERC_OUTPUT:-$HOME/.claude/settings.json}"
-  local yaml_mode=0
+  local yaml_mode=0 mode=apply
   [[ "${CLAUDE_MERGERC_YAML:-}" == (1|true|yes) ]] && yaml_mode=1
 
   local -a fragment_dirs include_patterns exclude_patterns
@@ -144,12 +186,13 @@ function claude-mergerc() {
 
   local OPTARG OPTIND opt
   OPTIND=1
-  while getopts ":d:i:x:yh" opt; do
+  while getopts ":d:i:x:ych" opt; do
     case "$opt" in
       d) fragment_dirs+=("$OPTARG") ;;
       i) include_patterns+=("$OPTARG") ;;
       x) exclude_patterns+=("$OPTARG") ;;
       y) yaml_mode=1 ;;
+      c) mode=check ;;
       h) _claude_mergerc_usage; return 0 ;;
       :) echo "error: -$OPTARG requires an argument" >&2; return 1 ;;
       \?) echo "error: unknown option -$OPTARG" >&2; return 1 ;;
@@ -225,6 +268,15 @@ function claude-mergerc() {
 
   local merged_json="$workdir/from-fragments.json"
   _claude_mergerc_merge "$merged_json" "${fragment_files[@]}"
+
+  if [[ "$mode" != apply ]]; then
+    if [[ ! -e "$output" ]]; then
+      echo "error: $output does not exist; nothing to check for drift" >&2
+      return 1
+    fi
+    _claude_mergerc_drift
+    return
+  fi
 
   # In YAML mode, stage the merged config as YAML for diff/editor.
   # YAML is for human eyes only: every path that writes $output writes JSON,
@@ -344,6 +396,53 @@ function claude-mergerc() {
       echo "No changes made."
       ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Drift: places where settings.json no longer matches the merged fragments,
+# usually because Claude Code wrote to settings.json itself (e.g. "always
+# allow" on a permission prompt).
+#
+# The helpers below share state through zsh's dynamic scoping. They read the
+# locals of claude-mergerc (output, workdir, merged_json) and of
+# _claude_mergerc_drift (jqlib).
+# ---------------------------------------------------------------------------
+
+# Print a one-line summary per item in file $1.
+function _claude_mergerc_drift_list() {
+  jq -r "$jqlib"'
+    def short: tojson | if length > 60 then .[:57] + "..." else . end;
+    (.path | pathstr) as $ps
+    | if .kind == "changed" then "  ~ \($ps): \(.merged | short) → \(.current | short)"
+      elif .kind == "added" then "  + \($ps): \(.current | short)"
+      elif .kind == "removed" then "  - \($ps): \(.merged | short)"
+      elif .kind == "array-add" then "  + \($ps)[]: \(.value | short)"
+      else "  - \($ps)[]: \(.value | short)"
+      end' "$1"
+  echo ""
+  echo "  (+ only in settings.json   - only in fragments   ~ fragments → settings.json)"
+}
+
+function _claude_mergerc_drift() {
+  local jqlib
+  jqlib=$(_claude_mergerc_jqlib)
+
+  local items_file="$workdir/drift.jsonl"
+  jq -c -n --slurpfile c "$output" --slurpfile m "$merged_json" \
+    "$jqlib drift_items(\$c[0]; \$m[0]; [])" > "$items_file"
+  local -a items
+  items=(${(f)"$(<"$items_file")"})
+
+  if (( ${#items} == 0 )); then
+    echo "No drift: settings.json matches the fragments."
+    return 0
+  fi
+
+  echo "Drift: ${#items} item(s) where settings.json differs from the fragments:"
+  echo ""
+  _claude_mergerc_drift_list "$items_file"
+
+  return 1
 }
 
 # On first invocation, zsh's native autoload executes this file's body — which
