@@ -49,6 +49,82 @@ function _claude_mergerc_require_yq() {
   fi
 }
 
+# Shared jq definitions.
+function _claude_mergerc_jqlib() {
+  cat <<'EOF'
+def deep_merge(a; b):
+  a as $a | b as $b |
+  if ($a | type) == "object" and ($b | type) == "object" then
+    ($a | keys) + ($b | keys) | unique | map(
+      . as $k |
+      if ($a | has($k)) and ($b | has($k)) then
+        {($k): deep_merge($a[$k]; $b[$k])}
+      elif ($b | has($k)) then {($k): $b[$k]}
+      else {($k): $a[$k]}
+      end
+    ) | add // {}
+  elif ($a | type) == "array" and ($b | type) == "array" then
+    $a + $b | unique
+  else $b
+  end;
+
+EOF
+}
+
+# Print a fragment as JSON.
+function _claude_mergerc_to_json() {
+  if [[ "$1" == *.(yaml|yml) ]]; then
+    yq -o=json '.' "$1"
+  else
+    jq '.' "$1"
+  fi
+}
+
+# _claude_mergerc_merge OUT FILE... — deep-merge fragments (in order) into OUT.
+function _claude_mergerc_merge() {
+  local out="$1"; shift
+  local -a inputs
+  local f n=0 converted
+  for f in "$@"; do
+    if [[ "$f" == *.(yaml|yml) ]]; then
+      converted="${out:h}/.yaml-to-json-$((++n)).json"
+      if ! _claude_mergerc_to_json "$f" > "$converted"; then
+        echo "error: failed to parse YAML fragment: $f" >&2
+        return 1
+      fi
+      inputs+=("$converted")
+    else
+      inputs+=("$f")
+    fi
+  done
+  jq -s "$(_claude_mergerc_jqlib)"' reduce .[] as $item ({}; deep_merge(.; $item))' \
+    "${inputs[@]}" > "$out"
+}
+
+function _claude_mergerc_show_diff() {
+  if command -v delta &>/dev/null; then
+    delta "$1" "$2" --pager=never || true
+  elif command -v colordiff &>/dev/null; then
+    colordiff "$1" "$2" || true
+  else
+    diff --color=auto -u "$1" "$2" || true
+  fi
+}
+
+# Does a fragment basename match the include/exclude patterns in scope?
+function _claude_mergerc_matches() {
+  local fname="$1" pat
+  local included=0
+  for pat in "${include_patterns[@]}"; do
+    if [[ "$fname" == ${~pat} ]]; then included=1; break; fi
+  done
+  (( included )) || return 1
+  for pat in "${exclude_patterns[@]}"; do
+    if [[ "$fname" == ${~pat} ]]; then return 1; fi
+  done
+  return 0
+}
+
 function claude-mergerc() {
   emulate -L zsh
   setopt local_options err_return no_unset pipe_fail
@@ -111,7 +187,7 @@ function claude-mergerc() {
   fi
 
   local -a fragment_files dir_files
-  local dir f fname pat included excluded
+  local dir f
   for dir in "${fragment_dirs[@]}"; do
     if [[ ! -d "$dir" ]]; then
       echo "warning: skipping missing fragments dir: $dir" >&2
@@ -119,18 +195,7 @@ function claude-mergerc() {
     fi
     dir_files=()
     for f in "$dir"/**/*(.N); do
-      fname="${f:t}"
-      included=0
-      for pat in "${include_patterns[@]}"; do
-        [[ "$fname" == ${~pat} ]] && { included=1; break; }
-      done
-      (( included )) || continue
-      excluded=0
-      for pat in "${exclude_patterns[@]}"; do
-        [[ "$fname" == ${~pat} ]] && { excluded=1; break; }
-      done
-      (( excluded )) && continue
-      dir_files+=("$f")
+      _claude_mergerc_matches "${f:t}" && dir_files+=("$f")
     done
     fragment_files+=("${(on)dir_files[@]}")
   done
@@ -156,43 +221,10 @@ function claude-mergerc() {
   # Expand $workdir now: function-scoped EXIT traps run after locals are gone.
   trap "rm -rf ${(q)workdir}" EXIT
 
-  # Convert YAML fragments to JSON so jq can merge a uniform stream.
-  local -a merge_inputs
-  local n=0 converted
-  for f in "${fragment_files[@]}"; do
-    if [[ "$f" == *.(yaml|yml) ]]; then
-      converted="$workdir/fragment-$((++n)).json"
-      if ! yq -o=json '.' "$f" > "$converted"; then
-        echo "error: failed to parse YAML fragment: $f" >&2
-        return 1
-      fi
-      merge_inputs+=("$converted")
-    else
-      merge_inputs+=("$f")
-    fi
-  done
-
   echo "Merging ${#fragment_files[@]} fragment(s) from ${#fragment_dirs[@]} dir(s)..."
 
   local merged_json="$workdir/from-fragments.json"
-  jq -s '
-      def deep_merge(a; b):
-        a as $a | b as $b |
-        if ($a | type) == "object" and ($b | type) == "object" then
-          ($a | keys) + ($b | keys) | unique | map(
-            . as $k |
-            if ($a | has($k)) and ($b | has($k)) then
-              {($k): deep_merge($a[$k]; $b[$k])}
-            elif ($b | has($k)) then {($k): $b[$k]}
-            else {($k): $a[$k]}
-            end
-          ) | add // {}
-        elif ($a | type) == "array" and ($b | type) == "array" then
-          $a + $b | unique
-        else $b
-        end;
-      reduce .[] as $item ({}; deep_merge(.; $item))
-    ' "${merge_inputs[@]}" > "$merged_json"
+  _claude_mergerc_merge "$merged_json" "${fragment_files[@]}"
 
   # In YAML mode, stage the merged config as YAML for diff/editor.
   # YAML is for human eyes only: every path that writes $output writes JSON,
@@ -247,13 +279,7 @@ function claude-mergerc() {
 
   echo "Differences found:\n"
 
-  if command -v delta &>/dev/null; then
-    delta "$diff_current" "$diff_merged" --pager=never || true
-  elif command -v colordiff &>/dev/null; then
-    colordiff "$diff_current" "$diff_merged" || true
-  else
-    diff --color=auto -u "$diff_current" "$diff_merged" || true
-  fi
+  _claude_mergerc_show_diff "$diff_current" "$diff_merged"
 
   echo ""
   echo "  [a] Apply merged config (overwrites current)"
