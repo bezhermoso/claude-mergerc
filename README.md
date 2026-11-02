@@ -60,7 +60,7 @@ If `~/.claude/settings.json` doesn't exist yet, it prints the merged output and 
 ### Flags
 
 ```
-claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
+claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-c | -D] [-h]
 ```
 
 | Flag       | Purpose                                                                 |
@@ -69,6 +69,8 @@ claude-mergerc [-d DIR]... [-i GLOB]... [-x GLOB]... [-y] [-h]
 | `-i GLOB`  | Add an include pattern — filename glob (repeatable). Extends `CLAUDE_MERGERC_INCLUDE`. |
 | `-x GLOB`  | Add an exclude pattern — filename glob (repeatable). Extends `CLAUDE_MERGERC_EXCLUDE`. |
 | `-y`       | YAML mode: stage the merged config as YAML, diff in YAML, and manual-merge in YAML buffers. Output is still JSON. |
+| `-c`       | Check for drift: list where `settings.json` differs from the fragments. Changes nothing; exits 1 if there is drift. |
+| `-D`       | Resolve drift interactively (see [Drift](#drift)). |
 | `-h`       | Show help.                                                              |
 
 Examples:
@@ -83,6 +85,41 @@ claude-mergerc -d ~/.config/claude/fragments-work
 # Skip any experimental fragments
 claude-mergerc -x '*-experimental.json'
 ```
+
+## Drift
+
+Claude Code writes to `settings.json` itself — for example when you choose "always allow" on a permission prompt — so over time it drifts from what your fragments produce. Running the default flow would silently throw those changes away.
+
+`claude-mergerc -c` lists every drifted item:
+
+```
+Drift: 4 item(s) where settings.json differs from the fragments:
+
+  + .env.NEW_VAR: "1"
+  ~ .model: "sonnet" → "opus"
+  + .permissions.allow[]: "Bash(npm test:*)"
+  - .permissions.allow[]: "Bash(ls:*)"
+
+  (+ only in settings.json   - only in fragments   ~ fragments → settings.json)
+```
+
+Arrays are compared as sets (that's how they merge), so each list entry that's present on only one side is its own item.
+
+`claude-mergerc -D` shows the same list, then walks through the items one at a time:
+
+- **[a] Adopt** — keep the `settings.json` value and make the fragments produce it.
+  - *Changed values* go into the fragment that currently wins the merge for that key.
+  - *New keys* go into a fragment that already holds the parent object. *New list entries* go into a fragment that already defines the list. If more than one fragment fits, you choose. The highest-precedence one is the default.
+  - Any additive adoption can instead go into a **new fragment file** (default `99-adopted.json`, or `.yaml` with `-y`, in the last fragments dir). A file you create is offered for later items too.
+  - *Removals* (a key or list entry that's in the fragments but not in `settings.json`) are adopted by removing it from every fragment that provides it.
+  - Each adoption is checked by re-merging. If it wouldn't take effect (for example, a new file that sorts before the fragment that overrides it), it's rolled back and you're asked again.
+- **[r] Revert** — put the fragments' value back into `settings.json`.
+- **[i] Ignore** — leave it as it is.
+- **[q] Quit** — stop and discard every decision.
+
+Nothing is written while you decide: every edit goes to staged copies. At the end you see a diff of each file that would change, then choose **[w]** write, **[b]** back up each touched file (`*.bak.<timestamp>`) then write, or **[q]** quit. Before writing, it checks that `settings.json` and the touched fragments haven't changed since they were read, and refuses to write if they have.
+
+YAML fragments are edited in place with `yq`, so comments and layout survive. JSON fragments are rewritten by `jq`, which normalizes their indentation.
 
 ## Configuration
 
