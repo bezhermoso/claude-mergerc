@@ -17,6 +17,8 @@ Modes:
               adopt  - keep the settings.json value and write it into a fragment
               revert - restore the value the fragments resolve to
               ignore - leave it as is
+              skip   - decide later (offered again at the end)
+              undo   - go back and redo the previous decision
             All changes are staged; nothing is written until you confirm.
 
 Options:
@@ -34,6 +36,8 @@ Environment (colon-separated lists):
   CLAUDE_MERGERC_EXCLUDE        Exclude globs.
   CLAUDE_MERGERC_OUTPUT         Output file. Default: ~/.claude/settings.json
   CLAUDE_MERGERC_YAML           Set to 1 to enable YAML mode (same as -y).
+  CLAUDE_MERGERC_COLOR          auto (default), always, or never. auto colours
+                                output on a colour terminal unless NO_COLOR is set.
 
 YAML fragments and YAML mode require yq (https://github.com/mikefarah/yq).
 
@@ -189,6 +193,13 @@ function _claude_mergerc_ask_yn() {
   local __yn
   _claude_mergerc_ask_key __yn "$1" yn || return 1
   [[ "$__yn" == y ]]
+}
+
+# _claude_mergerc_ask_line VAR PROMPT — read a line. Returns 1 if input ends.
+function _claude_mergerc_ask_line() {
+  local __var="$1" __line
+  if ! read -r "__line?$2"; then echo ""; return 1; fi
+  : ${(P)__var::=$__line}
 }
 
 # Does a fragment basename match the include/exclude patterns in scope?
@@ -633,77 +644,108 @@ function _claude_mergerc_drift_verify() {
   [[ "$(jq --argjson i "$1" "$jqlib resolved(\$i)" "$workdir/verify.json")" == true ]]
 }
 
-# Prompt for a new fragment file. Sets REPLY to its live path.
+# Prompt for a new fragment file until a usable one is given. Sets REPLY to
+# its live path. Returns 1 to go back, 2 to skip this item for now.
 function _claude_mergerc_drift_new_file() {
-  local last_dir="${fragment_dirs[-1]}" ext=json input dir match="" f abs
+  local last_dir="${fragment_dirs[-1]}" ext=json input dir match f abs found
   if (( yaml_mode )); then ext=yaml; fi
   local def="$last_dir/99-adopted.$ext"
-  read -r "input?  New fragment file [$(_claude_mergerc_tilde "$def")]: "
-  if [[ -z "$input" ]]; then input="$def"; fi
-  input="${input/#\~/$HOME}"
-  if [[ "$input" != */* ]]; then input="$last_dir/$input"; fi
-  abs="${input:A}"
-  for dir in "${fragment_dirs[@]}"; do
-    if [[ "$abs" == "${dir:A}"/* ]]; then
-      match="$dir/${abs#${dir:A}/}"
-      break
+  while true; do
+    if ! _claude_mergerc_ask_line input \
+        "  New fragment file [$(_claude_mergerc_tilde "$def")] (c: go back, s: skip for now): "; then
+      return 1
     fi
+    case "$input" in
+      c) return 1 ;;
+      s) return 2 ;;
+      "") input="$def" ;;
+    esac
+    input="${input/#\~/$HOME}"
+    if [[ "$input" != */* ]]; then input="$last_dir/$input"; fi
+    abs="${input:A}"
+    match=""
+    for dir in "${fragment_dirs[@]}"; do
+      if [[ "$abs" == "${dir:A}"/* ]]; then
+        match="$dir/${abs#${dir:A}/}"
+        break
+      fi
+    done
+    if [[ -z "$match" ]]; then
+      echo "  ✗ It must be inside a fragments dir: ${(j/, /)fragment_dirs}"
+      continue
+    fi
+    if ! _claude_mergerc_matches "${match:t}"; then
+      echo "  ✗ ${match:t} doesn't match the include/exclude patterns, so it would never be merged"
+      continue
+    fi
+    found=""
+    _claude_mergerc_drift_fragments
+    for f in "${reply[@]}"; do
+      if [[ "${f:A}" == "$abs" ]]; then found="$f"; break; fi
+    done
+    if [[ -n "$found" ]]; then
+      REPLY="$found"
+      return 0
+    fi
+    if [[ -e "$abs" ]]; then
+      echo "  ✗ $(_claude_mergerc_tilde "$abs") already exists but isn't a fragment"
+      continue
+    fi
+    new_files+=("$match")
+    REPLY="$match"
+    return 0
   done
-  if [[ -z "$match" ]]; then
-    echo "  ✗ It must be inside a fragments dir: ${(j/, /)fragment_dirs}"
-    return 1
-  fi
-  if ! _claude_mergerc_matches "${match:t}"; then
-    echo "  ✗ ${match:t} doesn't match the include/exclude patterns, so it would never be merged"
-    return 1
-  fi
-  _claude_mergerc_drift_fragments
-  for f in "${reply[@]}"; do
-    if [[ "${f:A}" == "$abs" ]]; then REPLY="$f"; return 0; fi
-  done
-  if [[ -e "$abs" ]]; then
-    echo "  ✗ $(_claude_mergerc_tilde "$abs") already exists but isn't a fragment"
-    return 1
-  fi
-  new_files+=("$match")
-  REPLY="$match"
 }
 
 # Choose among the candidates in reply (or a new file). Sets REPLY.
+# Returns 1 to go back, 2 to skip this item for now. Bad input asks again.
 function _claude_mergerc_drift_choose() {
   local -a cands
   cands=("${reply[@]}")
-  local i=0 f sel def="${#cands}" note
+  local i f sel def="${#cands}" note rc show=1
   if (( def == 0 )); then def=n; fi
-  echo "  Adopt into:"
-  for f in "${cands[@]}"; do
-    i=$((i + 1))
-    note=""
-    if [[ "$i" == "$def" ]]; then note="  (default)"; fi
-    echo "    [$i] $(_claude_mergerc_tilde "$f")$note"
+  while true; do
+    if (( show )); then
+      echo "  Adopt into:"
+      i=0
+      for f in "${cands[@]}"; do
+        i=$((i + 1))
+        note=""
+        if [[ "$i" == "$def" ]]; then note="  (default)"; fi
+        echo "    [$i] $(_claude_mergerc_tilde "$f")$note"
+      done
+      echo "    [n] a new fragment file"
+      echo "    [c] go back   [s] skip this item for now"
+      show=0
+    fi
+    if ! _claude_mergerc_ask_line sel "  Choose [$def]: "; then return 1; fi
+    sel="${sel:l}"
+    if [[ -z "$sel" ]]; then sel="$def"; fi
+    case "$sel" in
+      n)
+        _claude_mergerc_drift_new_file && return 0 || rc=$?
+        if (( rc == 2 )); then return 2; fi
+        show=1
+        continue
+        ;;
+      c) return 1 ;;
+      s) return 2 ;;
+      <->)
+        if (( sel >= 1 && sel <= ${#cands} )); then
+          REPLY="${cands[$sel]}"
+          return 0
+        fi
+        ;;
+    esac
+    echo "  No option \"$sel\". Pick one of the options above."
   done
-  echo "    [n] a new fragment file"
-  echo "    [c] cancel"
-  read -r "sel?  Choose [$def]: "
-  if [[ -z "$sel" ]]; then sel="$def"; fi
-  case "$sel" in
-    n) _claude_mergerc_drift_new_file; return ;;
-    c) return 1 ;;
-    <->)
-      if (( sel >= 1 && sel <= ${#cands} )); then
-        REPLY="${cands[$sel]}"
-        return 0
-      fi
-      ;;
-  esac
-  echo "  ✗ Invalid choice"
-  return 1
 }
 
-# Write the settings.json value into the fragments. Returns 1 (with nothing
-# staged) if cancelled or if the change wouldn't take effect.
+# Write the settings.json value into the fragments. Returns 0 when adopted,
+# 1 to go back to the item's prompt, 2 to skip the item; on 1 or 2 nothing is
+# left staged.
 function _claude_mergerc_drift_adopt() {
-  local item="$1" kind p v op target f
+  local item="$1" kind p v op target f rc answer
   local -a targets
   kind=$(jq -r '.kind' <<< "$item")
   p=$(jq -c '.path' <<< "$item")
@@ -716,9 +758,10 @@ function _claude_mergerc_drift_adopt() {
       fi
       _claude_mergerc_drift_candidates "$kind" "$p"
       _claude_mergerc_drift_snapshot
-      if ! _claude_mergerc_drift_choose; then
+      _claude_mergerc_drift_choose && rc=0 || rc=$?
+      if (( rc )); then
         _claude_mergerc_drift_restore
-        return 1
+        return $rc
       fi
       target="$REPLY"
       if ! _claude_mergerc_drift_edit "$target" "$op" "$p" "$v" \
@@ -742,8 +785,14 @@ function _claude_mergerc_drift_adopt() {
       targets=("${reply[@]}")
       echo "  Adopting removes it from:"
       for f in "${targets[@]}"; do echo "    $(_claude_mergerc_tilde "$f")"; done
-      if ! read -q "?  Proceed? [y/n] "; then echo ""; return 1; fi
-      echo ""
+      if ! _claude_mergerc_ask_key answer \
+          "  Proceed? [y] yes  [n] go back  [s] skip for now: " yns; then
+        return 1
+      fi
+      case "$answer" in
+        n) return 1 ;;
+        s) return 2 ;;
+      esac
       if [[ "$kind" == removed ]]; then op=delete; else op=remove-elem; fi
       _claude_mergerc_drift_snapshot
       for f in "${targets[@]}"; do
@@ -844,6 +893,43 @@ function _claude_mergerc_drift_show_change() {
   fi
 }
 
+# Undo history: before deciding the item at queue position N, save the staging
+# area so that undoing that decision can put it back exactly.
+function _claude_mergerc_drift_save() {
+  local h="$workdir/history/$1"
+  mkdir -p "$workdir/history"
+  rm -rf "$h"
+  cp -R "$stage_dir" "$h"
+  print -rl -- "${(@kv)staged}" > "$h.staged"
+  print -rl -- "${new_files[@]}" > "$h.new"
+}
+
+function _claude_mergerc_drift_load() {
+  local h="$workdir/history/$1"
+  local -a kv nf
+  rm -rf "$stage_dir"
+  cp -R "$h" "$stage_dir"
+  kv=(${(f)"$(<"$h.staged")"})
+  staged=("${kv[@]}")
+  nf=(${(f)"$(<"$h.new")"})
+  new_files=("${nf[@]}")
+}
+
+# Undo the decision before queue position pos: restore the staging area saved
+# before it, forget it (and any revisit pass queued after it), and step back.
+function _claude_mergerc_drift_undo() {
+  local -a parts
+  pos=$((pos - 1))
+  parts=("${(@ps:\t:)decisions[$pos]}")
+  echo "  ↶ Undid: ${parts[3]}"
+  _claude_mergerc_drift_load "$pos"
+  decisions=("${(@)decisions[1,pos-1]}")
+  while (( ${#passes} )) && (( pos <= passes[-1] )); do
+    queue=("${(@)queue[1,passes[-1]]}")
+    passes=("${(@)passes[1,-2]}")
+  done
+}
+
 function _claude_mergerc_drift() {
   local mode="$1"
   local jqlib
@@ -871,117 +957,208 @@ function _claude_mergerc_drift() {
   local stage_dir="$workdir/stage"
   local stage_settings="$stage_dir/settings.json"
   local stage_n=0
-  local -A staged snap_staged origs
-  local -a new_files snap_new decisions
+  local -A staged snap_staged origs final_type final_text
+  local -a new_files snap_new
   mkdir -p "$stage_dir" "$workdir/orig"
   cp "$output" "$stage_settings"
   cp "$output" "$workdir/orig/settings.json"
 
-  local n=0 item choice ps adopted=0 reverted=0 ignored=0
-  for item in "${items[@]}"; do
-    n=$((n + 1))
-    ps=$(jq -r "$jqlib"'
-      (.path | pathstr) + (if .kind | startswith("array-") then "[] \(.value | tojson)" else "" end)
-      ' <<< "$item")
-    echo ""
-    _claude_mergerc_drift_show "$n" "${#items}" "$item"
-    while true; do
-      read -k 1 "choice?  [a]dopt  [r]evert  [i]gnore  [q]uit: "
+  # Items are worked through as a queue. decisions[N] records the decision
+  # made at queue position N as "type<TAB>item index<TAB>summary"; undo steps
+  # pos back and restores the staging area saved before that decision.
+  # Skipped items can be appended for another pass; passes[] remembers the
+  # queue length before each append so undo can take the append back too.
+  local total=${#items} pos=1 idx item choice ps rc keys prompt rec type text
+  local adopted reverted left settings_changed before after remaining f
+  local -a queue decisions passes skipped parts changed_frags
+  queue=({1..$total})
+
+  while true; do
+    while (( pos <= ${#queue} )); do
+      idx=${queue[$pos]}
+      item=${items[$idx]}
+      ps=$(jq -r "$jqlib"'
+        (.path | pathstr) + (if .kind | startswith("array-") then "[] \(.value | tojson)" else "" end)
+        ' <<< "$item")
       echo ""
-      case "$choice" in
-        a)
-          if _claude_mergerc_drift_adopt "$item"; then
-            decisions+=("$ps: $REPLY")
-            adopted=$((adopted + 1))
+      _claude_mergerc_drift_show "$idx" "$total" "$item"
+      if (( pos > total )); then echo "    (skipped earlier)"; fi
+      _claude_mergerc_drift_save "$pos"
+
+      keys=aris
+      prompt="  [a]dopt  [r]evert  [i]gnore  [s]kip for now"
+      if (( pos > 1 )); then
+        keys+=u
+        prompt+="  [u]ndo previous"
+      fi
+      keys+=q
+      prompt+="  [q]uit: "
+
+      while true; do
+        if ! _claude_mergerc_ask_key choice "$prompt" "$keys"; then choice=eof; fi
+        case "$choice" in
+          a)
+            _claude_mergerc_drift_adopt "$item" && rc=0 || rc=$?
+            if (( rc == 0 )); then
+              decisions[$pos]="adopt"$'\t'"$idx"$'\t'"$ps: $REPLY"
+              break
+            elif (( rc == 2 )); then
+              choice=s
+              decisions[$pos]="skip"$'\t'"$idx"$'\t'"$ps: skipped"
+              echo "  Skipped for now; you'll be offered it again at the end."
+              break
+            fi
+            # rc 1: went back; ask about this item again.
+            ;;
+          r)
+            _claude_mergerc_drift_revert "$item"
+            decisions[$pos]="revert"$'\t'"$idx"$'\t'"$ps: reverted to the fragments' value"
             break
-          fi
-          ;;
-        r)
-          _claude_mergerc_drift_revert "$item"
-          decisions+=("$ps: reverted to the fragments' value")
-          reverted=$((reverted + 1))
-          break
-          ;;
-        i)
-          decisions+=("$ps: ignored")
-          ignored=$((ignored + 1))
-          break
-          ;;
-        q)
-          echo "Quit. Nothing was written."
-          return 0
-          ;;
-        *)
-          echo "  Choose a, r, i, or q."
-          ;;
+            ;;
+          i)
+            decisions[$pos]="ignore"$'\t'"$idx"$'\t'"$ps: ignored"
+            break
+            ;;
+          s)
+            decisions[$pos]="skip"$'\t'"$idx"$'\t'"$ps: skipped"
+            echo "  Skipped for now; you'll be offered it again at the end."
+            break
+            ;;
+          u)
+            break
+            ;;
+          q|eof)
+            if [[ "$choice" == q ]] && (( pos > 1 )); then
+              if ! _claude_mergerc_ask_yn "  Discard your $((pos - 1)) decision(s) and quit? [y/n] "; then
+                continue
+              fi
+            fi
+            echo "Quit. Nothing was written."
+            return 0
+            ;;
+        esac
+      done
+
+      if [[ "$choice" == u ]]; then
+        _claude_mergerc_drift_undo
+        continue
+      fi
+      pos=$((pos + 1))
+    done
+
+    # The latest decision for each item wins (skipped items may be revisited).
+    final_type=() final_text=()
+    for rec in "${decisions[@]}"; do
+      parts=("${(@ps:\t:)rec}")
+      final_type[${parts[2]}]="${parts[1]}"
+      final_text[${parts[2]}]="${parts[3]}"
+    done
+    skipped=() adopted=0 reverted=0 left=0
+    for idx in {1..$total}; do
+      case "${final_type[$idx]}" in
+        adopt)  adopted=$((adopted + 1)) ;;
+        revert) reverted=$((reverted + 1)) ;;
+        skip)   skipped+=("$idx"); left=$((left + 1)) ;;
+        *)      left=$((left + 1)) ;;
       esac
     done
-  done
 
-  echo ""
-  if (( adopted + reverted == 0 )); then
-    echo "Nothing to write: every item was ignored."
-    return 0
-  fi
-
-  echo "Decisions:"
-  print -rl -- "  "${^decisions}
-
-  echo ""
-  echo "Staged changes:"
-  local settings_changed=0
-  if ! cmp -s "$stage_settings" "$workdir/orig/settings.json"; then
-    settings_changed=1
-    local before="$workdir/review/settings.before" after="$workdir/review/settings.after"
-    mkdir -p "$workdir/review"
-    if (( yaml_mode )); then
-      yq -p=json -o=yaml -P 'sort_keys(..)' "$workdir/orig/settings.json" > "$before.yaml"
-      yq -p=json -o=yaml -P 'sort_keys(..)' "$stage_settings" > "$after.yaml"
-      before+=.yaml after+=.yaml
-    else
-      jq -S '.' "$workdir/orig/settings.json" > "$before.json"
-      jq -S '.' "$stage_settings" > "$after.json"
-      before+=.json after+=.json
+    if (( ${#skipped} )); then
+      echo ""
+      if _claude_mergerc_ask_yn "You skipped ${#skipped} item(s). Go through them now? [y/n] "; then
+        passes+=("${#queue}")
+        queue+=("${skipped[@]}")
+        continue
+      fi
     fi
-    _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$output")" "$before" "$after"
-  fi
 
-  local -a changed_frags
-  local f
-  _claude_mergerc_drift_fragments
-  for f in "${reply[@]}"; do
-    if [[ -z "${staged[$f]:-}" ]]; then continue; fi
-    if [[ -n "${origs[$f]:-}" ]]; then
-      if cmp -s "${origs[$f]}" "${staged[$f]}"; then continue; fi
-      _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f")" "${origs[$f]}" "${staged[$f]}"
-    else
-      _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f") (new file)" /dev/null "${staged[$f]}"
+    echo ""
+    echo "Decisions:"
+    for idx in {1..$total}; do
+      echo "  ${final_text[$idx]}"
+    done
+
+    if (( adopted + reverted == 0 )); then
+      echo ""
+      echo "Nothing to write: nothing was adopted or reverted."
+      if _claude_mergerc_ask_key choice \
+          "  [u]ndo previous  [q]uit: " uq \
+          && [[ "$choice" == u ]]; then
+        _claude_mergerc_drift_undo
+        continue
+      fi
+      return 0
     fi
-    changed_frags+=("$f")
+
+    echo ""
+    echo "Staged changes:"
+    settings_changed=0
+    if ! cmp -s "$stage_settings" "$workdir/orig/settings.json"; then
+      settings_changed=1
+      before="$workdir/review/settings.before" after="$workdir/review/settings.after"
+      mkdir -p "$workdir/review"
+      if (( yaml_mode )); then
+        yq -p=json -o=yaml -P 'sort_keys(..)' "$workdir/orig/settings.json" > "$before.yaml"
+        yq -p=json -o=yaml -P 'sort_keys(..)' "$stage_settings" > "$after.yaml"
+        before+=.yaml after+=.yaml
+      else
+        jq -S '.' "$workdir/orig/settings.json" > "$before.json"
+        jq -S '.' "$stage_settings" > "$after.json"
+        before+=.json after+=.json
+      fi
+      _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$output")" "$before" "$after"
+    fi
+
+    changed_frags=()
+    _claude_mergerc_drift_fragments
+    for f in "${reply[@]}"; do
+      if [[ -z "${staged[$f]:-}" ]]; then continue; fi
+      if [[ -n "${origs[$f]:-}" ]]; then
+        if cmp -s "${origs[$f]}" "${staged[$f]}"; then continue; fi
+        _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f")" "${origs[$f]}" "${staged[$f]}"
+      else
+        _claude_mergerc_drift_show_change "$(_claude_mergerc_tilde "$f") (new file)" /dev/null "${staged[$f]}"
+      fi
+      changed_frags+=("$f")
+    done
+
+    _claude_mergerc_drift_merge "$workdir/final.json"
+    remaining=$(jq -n --slurpfile c "$stage_settings" --slurpfile m "$workdir/final.json" \
+      "$jqlib [drift_items(\$c[0]; \$m[0]; [])] | length")
+    echo ""
+    if (( remaining == left )); then
+      echo "After writing, $remaining item(s) will still drift (the ones you ignored or skipped)."
+    else
+      echo "warning: after writing, $remaining item(s) will still drift, but you left $left as they are." >&2
+      echo "         Run 'claude-mergerc -c' afterwards to see what's left." >&2
+    fi
+
+    echo ""
+    echo "  [w] Write changes"
+    echo "  [b] Back up every file it touches, then write"
+    echo "  [u] Undo the last decision and go back"
+    echo "  [q] Quit without writing"
+    while true; do
+      if ! _claude_mergerc_ask_key choice "Choose [w/b/u/q]: " wbuq; then
+        echo "Nothing was written."
+        return 0
+      fi
+      if [[ "$choice" == q ]]; then
+        if _claude_mergerc_ask_yn "Discard all your decisions and quit without writing? [y/n] "; then
+          echo "Nothing was written."
+          return 0
+        fi
+        continue
+      fi
+      break
+    done
+
+    if [[ "$choice" == u ]]; then
+      _claude_mergerc_drift_undo
+      continue
+    fi
+    break
   done
-
-  local remaining
-  _claude_mergerc_drift_merge "$workdir/final.json"
-  remaining=$(jq -n --slurpfile c "$stage_settings" --slurpfile m "$workdir/final.json" \
-    "$jqlib [drift_items(\$c[0]; \$m[0]; [])] | length")
-  echo ""
-  if (( remaining == ignored )); then
-    echo "After writing, $remaining item(s) will still drift (the ones you ignored)."
-  else
-    echo "warning: after writing, $remaining item(s) will still drift, but you ignored $ignored." >&2
-    echo "         Run 'claude-mergerc -c' afterwards to see what's left." >&2
-  fi
-
-  echo ""
-  echo "  [w] Write changes"
-  echo "  [b] Back up every file it touches, then write"
-  echo "  [q] Quit without writing"
-  read -k 1 "choice?Choose [w/b/q]: "
-  echo ""
-  if [[ "$choice" != (w|b) ]]; then
-    echo "Nothing was written."
-    return 0
-  fi
 
   # Refuse to write over anything that changed since we read it — Claude Code
   # may have written settings.json while you were deciding.

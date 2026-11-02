@@ -115,9 +115,13 @@ Arrays are compared as sets (that's how they merge), so each list entry that's p
   - Each adoption is checked by re-merging. If it wouldn't take effect (for example, a new file that sorts before the fragment that overrides it), it's rolled back and you're asked again.
 - **[r] Revert** — put the fragments' value back into `settings.json`.
 - **[i] Ignore** — leave it as it is.
-- **[q] Quit** — stop and discard every decision.
+- **[s] Skip for now** — move on and decide later. Skipped items are offered again once you reach the end. Skip is also available inside adopt's prompts (choosing a fragment, naming a new file, confirming a removal), and backs out of whatever was half-done.
+- **[u] Undo previous** — go back to the previous item and undo what you decided for it, including any staged edits.
+- **[q] Quit** — stop and discard every decision (asks first if you've made any).
 
-Nothing is written while you decide: every edit goes to staged copies. At the end you see a diff of each file that would change, then choose **[w]** write, **[b]** back up each touched file (`*.bak.<timestamp>`) then write, or **[q]** quit. Before writing, it checks that `settings.json` and the touched fragments haven't changed since they were read, and refuses to write if they have.
+A key that isn't one of the options just asks again; it's never taken as a choice. Inside adopt, **[c]** (or **[n]** at a confirmation) goes back to the item's prompt.
+
+Nothing is written while you decide: every edit goes to staged copies. At the end you see a diff of each file that would change, then choose **[w]** write, **[b]** back up each touched file (`*.bak.<timestamp>`) then write, **[u]** undo the last decision and go back, or **[q]** quit (after a confirmation). Before writing, it checks that `settings.json` and the touched fragments haven't changed since they were read, and refuses to write if they have.
 
 YAML fragments are edited in place with `yq`, so comments and layout survive. JSON fragments are rewritten by `jq`, which normalizes their indentation.
 
