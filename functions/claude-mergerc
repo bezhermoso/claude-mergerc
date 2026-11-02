@@ -71,10 +71,10 @@ def deep_merge(a; b):
 EOF
 }
 
-# Print a fragment as JSON.
+# Print a fragment as JSON. An empty YAML file reads as {} rather than null.
 function _claude_mergerc_to_json() {
   if [[ "$1" == *.(yaml|yml) ]]; then
-    yq -o=json '.' "$1"
+    yq -o=json '. // {}' "$1"
   else
     jq '.' "$1"
   fi
