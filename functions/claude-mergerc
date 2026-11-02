@@ -167,6 +167,30 @@ function _claude_mergerc_show_diff() {
   fi
 }
 
+# _claude_mergerc_ask_key VAR PROMPT KEYS — read single keypresses until one of
+# KEYS (case-insensitive) is pressed; anything else asks again instead of
+# being taken as a choice. Returns 1 only if input ends (e.g. Ctrl-D).
+function _claude_mergerc_ask_key() {
+  local __var="$1" __prompt="$2" __keys="$3" __k
+  while true; do
+    if ! read -k 1 "__k?$__prompt"; then echo ""; return 1; fi
+    if [[ "$__k" != $'\n' ]]; then echo ""; fi
+    __k="${__k:l}"
+    if [[ "$__k" != [[:space:]] && "$__keys" == *"$__k"* ]]; then
+      : ${(P)__var::=$__k}
+      return 0
+    fi
+    print -r -- "  Please press ${(j:, :)${(s::)__keys}}."
+  done
+}
+
+# _claude_mergerc_ask_yn PROMPT — 0 for y, 1 for n (or end of input).
+function _claude_mergerc_ask_yn() {
+  local __yn
+  _claude_mergerc_ask_key __yn "$1" yn || return 1
+  [[ "$__yn" == y ]]
+}
+
 # Does a fragment basename match the include/exclude patterns in scope?
 function _claude_mergerc_matches() {
   local fname="$1" pat
@@ -310,8 +334,10 @@ function claude-mergerc() {
       jq '.' "$merged_json"
     fi
     echo ""
-    read -q "reply?Create $output? [y/n] " || { echo "\nAborted."; return 0 }
-    echo ""
+    if ! _claude_mergerc_ask_yn "Create $output? [y/n] "; then
+      echo "Aborted."
+      return 0
+    fi
     mkdir -p "$(dirname "$output")"
     cp "$merged_json" "$output"
     echo "Created $output"
@@ -348,6 +374,8 @@ function claude-mergerc() {
 
   _claude_mergerc_show_diff "$diff_current" "$diff_merged"
 
+  local format=JSON
+  if (( yaml_mode )); then format=YAML; fi
   echo ""
   echo "  [a] Apply merged config (overwrites current)"
   echo "  [b] Backup current, then apply"
@@ -359,8 +387,10 @@ function claude-mergerc() {
   echo "  [q] Quit, no changes"
   echo ""
   local choice
-  read -k 1 "choice?Choose [a/b/e/q]: "
-  echo ""
+  if ! _claude_mergerc_ask_key choice "Choose [a/b/e/q]: " abeq; then
+    echo "No changes made."
+    return 0
+  fi
 
   case "$choice" in
     a)
@@ -378,36 +408,47 @@ function claude-mergerc() {
       # Buffer names signal intent: "to-apply" is seeded from the current
       # settings, is the one you edit, and is what gets written to $output.
       # "from-fragments" is the merged result, opened as reference only.
+      local apply_tmp apply_json reference again valid
       if (( yaml_mode )); then
-        local apply_tmp="$workdir/to-apply.yaml" apply_json="$workdir/to-apply.json"
+        apply_tmp="$workdir/to-apply.yaml" apply_json="$workdir/to-apply.json"
+        reference="$merged_yaml"
         cp "$diff_current" "$apply_tmp"
-        ${EDITOR:-vim} -d "$apply_tmp" "$merged_yaml"
-        if yq -o=json '.' "$apply_tmp" > "$apply_json" 2>/dev/null \
-            && jq empty "$apply_json" 2>/dev/null; then
-          read -q "reply?Apply manually merged result? [y/n] " || { echo "\nAborted."; return 0 }
-          echo ""
-          cp "$apply_json" "$output"
-          echo "Applied manually merged config."
-        else
-          echo "error: result is not valid YAML. Aborting." >&2
-          return 1
-        fi
       else
-        local apply_tmp="$workdir/to-apply.json"
+        apply_tmp="$workdir/to-apply.json" apply_json="$workdir/to-apply.json"
+        reference="$merged_json"
         cp "$output" "$apply_tmp"
-        ${EDITOR:-vim} -d "$apply_tmp" "$merged_json"
-        if jq empty "$apply_tmp" 2>/dev/null; then
-          read -q "reply?Apply manually merged result? [y/n] " || { echo "\nAborted."; return 0 }
-          echo ""
-          cp "$apply_tmp" "$output"
-          echo "Applied manually merged config."
-        else
-          echo "error: result is not valid JSON. Aborting." >&2
+      fi
+      while true; do
+        ${EDITOR:-vim} -d "$apply_tmp" "$reference"
+        valid=0
+        if (( yaml_mode )); then
+          if yq -o=json '.' "$apply_tmp" > "$apply_json" 2>/dev/null \
+              && jq empty "$apply_json" 2>/dev/null; then
+            valid=1
+          fi
+        elif jq empty "$apply_tmp" 2>/dev/null; then
+          valid=1
+        fi
+        if (( valid )); then break; fi
+        # Your edits are kept: editing again reopens them.
+        echo "error: the result is not valid $format." >&2
+        if ! _claude_mergerc_ask_key again \
+            "  [e] Edit again  [q] Quit, no changes: " eq; then
+          again=q
+        fi
+        if [[ "$again" == q ]]; then
+          echo "No changes made."
           return 1
         fi
+      done
+      if ! _claude_mergerc_ask_yn "Apply manually merged result? [y/n] "; then
+        echo "Aborted."
+        return 0
       fi
+      cp "$apply_json" "$output"
+      echo "Applied manually merged config."
       ;;
-    q|*)
+    q)
       echo "No changes made."
       ;;
   esac
